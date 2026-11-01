@@ -1,0 +1,3 @@
+# 서버 본체는 Python 표준 라이브러리만 사용해요. AI 분석에만 SDK가 필요해요.
+google-genai>=2.34,<3   # 기본 AI: Google Gemini (Interactions API)
+anthropic>=2.3,<3       # 선택: HEALTHLINGO_AI_PROVIDER=anthropic 일 때만 사용
