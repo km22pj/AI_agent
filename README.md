@@ -15,6 +15,8 @@
 | `backend/ai.py` | AI(기본 Gemini) 음식 인식·영양 추정·식단 피드백, 응답 검증 |
 | `backend/logic.py` | 입력 검증, 영양 합계·달성률·평가 계산 |
 | `backend/db.py` | SQLite 스키마 |
+| `backend/backup.py` | 데이터 백업, 클라우드 서버용 묶음 만들기 |
+| `deploy/setup_server.sh` | 클라우드 VM 설치·업데이트 스크립트 |
 | `data/` | 실행 시 생성. `healthlingo.db`(기록) + `uploads/u<사용자ID>/`(사진, 비공개) |
 | `tests/` | 자동 테스트 |
 
@@ -52,14 +54,15 @@ copy .env.example .env          # 값 채우기 (아래 참고)
 | `HEALTHLINGO_DEV_LOGIN` | 개발용 | `1`이면 이 컴퓨터에서만 Google 없이 쓰는 테스트 계정 로그인 표시 (Google 로그인 아님). 아래 외부 공개 설정이 하나라도 있으면 자동으로 꺼져요 |
 | `HEALTHLINGO_PUBLIC_URL` | 외부 공개 시 | 외부 공개 주소 (예: `https://내PC이름.tailXXXX.ts.net`) |
 | `HEALTHLINGO_INVITE_CODE` | 외부 공개 시 | 초대 링크 코드. 설정하면 초대 링크로 들어온 브라우저만 이용 가능 |
-| `HEALTHLINGO_ALLOWED_EMAILS` | 외부 공개 시 | 로그인을 허용할 Google 계정(쉼표 구분). 설정하면 목록에 없는 계정은 로그인 불가 |
+| `HEALTHLINGO_ALLOWED_EMAILS` | 선택 | 로그인을 허용할 Google 계정(쉼표 구분). 비워 두면(기본) Google 계정이면 누구나 로그인, 설정하면 목록에 있는 계정만 로그인 |
+| `HEALTHLINGO_AUTO_FUNNEL` | 선택 | 기본 `1`. 공개 주소가 `*.ts.net`이면 서버 시작 때 Tailscale Funnel을 다시 등록(`funnel reset` → `funnel --bg 포트`). `0`이면 끔 |
 
 값은 `.env` 파일이나 시스템 환경변수로 넣을 수 있어요. 서버는 값이 있는지만 출력하고 값 자체는 출력하지 않아요.
 
 ## Google 로그인 설정
 
 1. [Google Cloud 콘솔](https://console.cloud.google.com/)에서 프로젝트를 만들거나 선택해요.
-2. **Google 인증 플랫폼(Google Auth Platform)** → 브랜딩에서 앱 이름·지원 이메일을 입력하고, 대상에서 *외부*를 골라요. 이 앱은 기본 정보(이름·이메일·프로필)만 요청하므로 "테스트" 상태여도 **테스트 사용자 등록이 필요 없어요.** 누가 로그인할 수 있는지는 `.env`의 `HEALTHLINGO_ALLOWED_EMAILS`로 정해요.
+2. **Google 인증 플랫폼(Google Auth Platform)** → 브랜딩에서 앱 이름·지원 이메일을 입력하고, 대상에서 *외부*를 골라요. 이 앱은 기본 정보(이름·이메일·프로필)만 요청하므로 "테스트" 상태여도 **테스트 사용자 등록이 필요 없어요.** Google 계정이면 누구나 로그인할 수 있고, 계정을 제한하고 싶을 때만 `.env`의 `HEALTHLINGO_ALLOWED_EMAILS`를 쓰면 돼요.
 3. **클라이언트 → 클라이언트 만들기** → 애플리케이션 유형 **웹 애플리케이션**.
 4. **승인된 JavaScript 원본**에 아래 두 개를 추가해요.
    - `http://localhost:8000`
@@ -84,26 +87,88 @@ Claude로 되돌리려면 `HEALTHLINGO_AI_PROVIDER=anthropic`과 `ANTHROPIC_API_
 
 ## 외부 공개 (초대받은 사람만)
 
-Tailscale Funnel로 이 PC의 서버를 `https://내PC이름.tailXXXX.ts.net` 형태의 주소에 연결해요(실제 주소는 `tailscale funnel status`로 확인하고 `.env`의 `HEALTHLINGO_PUBLIC_URL`에 넣어요). PC와 서버가 켜져 있는 동안만 접속돼요.
+Tailscale Funnel로 이 PC의 서버를 `https://내PC이름.tailXXXX.ts.net` 형태의 주소에 연결해요(실제 주소는 `tailscale funnel status`로 확인하고 `.env`의 `HEALTHLINGO_PUBLIC_URL`에 넣어요). PC와 서버가 켜져 있는 동안만 접속돼요. PC가 꺼져 있어도 접속되게 하려면 아래 "클라우드 서버"를 보세요.
 
 **접근 제어 (두 단계)**
 1. **초대 링크**: `HEALTHLINGO_INVITE_CODE`가 있으면 `주소/?invite=코드`로 처음 들어온 브라우저에만 접근 쿠키(180일)를 줘요. 쿠키가 없으면 앱 화면·API 모두 "초대받은 사람만 이용할 수 있어요" 안내만 보여요. 링크를 열면 주소창에서 코드는 바로 지워져요.
-2. **허용 계정**: `HEALTHLINGO_ALLOWED_EMAILS`에 있는 Google 계정만 로그인돼요. 목록에서 빼면 이미 로그인한 사람도 다음 요청부터 막혀요.
+2. **허용 계정 (선택, 현재 꺼짐)**: 비워 두면 초대 링크로 들어온 사람은 어떤 Google 계정으로든 로그인할 수 있어요. `HEALTHLINGO_ALLOWED_EMAILS`에 이메일을 넣으면 그 계정만 로그인되고, 목록에서 빼면 이미 로그인한 사람도 다음 요청부터 막혀요.
 
 **자주 쓰는 명령**
 ```powershell
 .\.venv\Scripts\python.exe run.py --show-invite      # 공유할 초대 링크 보기
 .\.venv\Scripts\python.exe run.py --new-invite-code  # 새 코드 만들기 → .env에 넣고 서버 재시작
+.\.venv\Scripts\python.exe run.py --allow 팀원@gmail.com   # 허용 계정 추가 (재시작 불필요)
+.\.venv\Scripts\python.exe run.py --disallow 팀원@gmail.com  # 허용 계정 제거 (재시작 불필요)
+.\.venv\Scripts\python.exe run.py --allowed                # 허용 계정 목록 보기
 & "$env:ProgramFiles\Tailscale\tailscale.exe" funnel status          # 공개 상태 확인
 & "$env:ProgramFiles\Tailscale\tailscale.exe" funnel --https=443 off # 외부 공개 끄기
 & "$env:ProgramFiles\Tailscale\tailscale.exe" funnel --bg 8000       # 다시 켜기
 ```
 
 - 링크가 원치 않는 사람에게 퍼졌으면: 새 코드를 만들어 `.env`에 넣고 서버를 재시작하세요. 기존 링크와 그 링크로 받은 접근 쿠키가 모두 무효가 돼요. 허용 계정 목록이 있으면 링크가 퍼져도 목록 밖 계정은 로그인할 수 없어요.
-- 사람 추가: `HEALTHLINGO_ALLOWED_EMAILS`에 Gmail 주소를 쉼표로 더하고 서버를 재시작한 뒤 초대 링크를 보내세요.
+- 사람 추가: 허용 계정이 꺼져 있으면 초대 링크만 보내면 돼요. 켜 둔 경우에는 `run.py --allow 이메일`을 실행하거나 `.env`의 `HEALTHLINGO_ALLOWED_EMAILS`에 Gmail 주소를 쉼표로 더한 뒤 초대 링크를 보내세요. 실행 중인 서버가 `.env` 변경을 감지해 바로 적용해요. 목록에 없는 계정이 로그인을 시도하면 서버 창에 그 이메일과 추가 명령이 표시돼요.
 - Google 로그인: Google Cloud 콘솔의 OAuth 클라이언트 → **승인된 JavaScript 원본**에 외부 공개 주소(`HEALTHLINGO_PUBLIC_URL` 값)를 추가해야 외부에서 로그인돼요.
-- Funnel은 `--bg`로 켜 두어서 PC를 재부팅해도 다시 켜져요(Tailscale 트레이 앱이 실행 중이어야 해요). 서버(`run.py`)는 직접 실행해야 해요.
+- 서버(`run.py`)를 시작하면 Funnel을 자동으로 다시 등록해요(백그라운드, Tailscale이 켜지는 중이면 최대 90초 기다림). 외부에서 열리기까지 30초 정도 걸려요. 서버 창에 "Tailscale Funnel을 다시 등록했어요"가 보이면 성공이고, 실패하면 이유가 경고로 표시돼요. Tailscale 트레이 앱은 실행 중이어야 해요.
+- **이 PC에서는 열리는데 다른 장치에서 `ERR_CONNECTION_CLOSED`가 뜨면**: 이 PC는 Tailscale 내부 경로로 접속해서 외부 공개 상태를 확인할 수 없어요. 서버를 다시 시작하거나, 아래 명령으로 Funnel을 직접 다시 등록하세요.
+  ```powershell
+  & "$env:ProgramFiles\Tailscale\tailscale.exe" funnel reset
+  & "$env:ProgramFiles\Tailscale\tailscale.exe" funnel --bg 8000
+  ```
+  확인은 휴대폰 데이터(와이파이 끄기)로 접속하거나, https://check-host.net 에서 주소를 넣어 해외에서 열리는지 보면 돼요(초대 링크 없이 열면 403 안내 페이지가 정상).
 - 외부 사용자의 AI 분석 비용은 내 Gemini 키로 나가요.
+
+## PC가 꺼져 있어도 접속 (클라우드 서버)
+
+Google Cloud 무료 VM(e2-micro, "Always Free")에 같은 앱을 그대로 올려요. 기록(SQLite)과 사진은 VM 디스크에 남고, 공개 주소는 VM에서 Tailscale Funnel로 만들어요(도메인 불필요). 서버는 자동 실행 서비스로 등록돼서 VM이 재부팅돼도 다시 켜져요.
+
+**1. VM 만들기 (Google Cloud 콘솔, 직접 해야 해요)**
+1. https://console.cloud.google.com → OAuth 클라이언트가 있는 프로젝트 선택 → 결제 계정 연결(카드 등록 필요). 무료 범위 안에서는 청구되지 않지만, **결제 > 예산 및 알림**에서 작은 금액(예: 1,000원) 알림을 꼭 만들어 두세요.
+2. **Compute Engine > VM 인스턴스 > 인스턴스 만들기** (처음이면 API 사용 설정)
+   - 리전: `us-west1`, `us-central1`, `us-east1` 중 하나 (그 외 리전은 유료)
+   - 머신 유형: `e2-micro`
+   - 부팅 디스크: **Ubuntu 24.04 LTS (x86/64)**, 디스크 유형 **표준 영구 디스크(Standard)**, 30GB 이하 (균형/SSD는 유료)
+   - 방화벽의 HTTP/HTTPS 허용은 체크하지 않아도 돼요(Funnel이 바깥으로 연결해요). 외부 IP는 기본값(임시) 그대로 두세요.
+3. 무료 범위: e2-micro 1대, 표준 디스크 30GB, 북미 밖으로 나가는 트래픽 월 1GB. 사진을 많이 보면 1GB를 넘을 수 있고, 넘으면 GB당 소액이 청구돼요. 처음 며칠은 **결제 > 보고서**에서 금액이 0원인지 확인하세요.
+
+**2. PC에서 옮길 파일 만들기**
+```powershell
+# 먼저 PC의 서버를 끄세요(Ctrl+C). 이후 PC에 저장한 기록은 옮겨지지 않아요.
+.\.venv\Scripts\python.exe run.py --export-server-bundle
+```
+`dist\healthlingo-server.tar.gz`가 만들어져요. 코드 + `.env`(API 키) + 기록·사진 사본이 들어 있으니 다른 곳에 공유하지 마세요.
+
+**3. VM에 설치**
+1. VM 목록의 **SSH** 버튼 → 열린 창 오른쪽 위 **파일 업로드**로 `healthlingo-server.tar.gz` 올리기
+2. 같은 창에서:
+   ```bash
+   tar xzf healthlingo-server.tar.gz
+   sudo bash healthlingo/deploy/setup_server.sh
+   ```
+3. 중간에 `https://login.tailscale.com/...` 주소가 나오면 PC 브라우저에서 열고, PC와 **같은 Tailscale 계정**으로 승인하세요.
+4. 끝나면 공개 주소(예: `https://healthlingo.tailXXXX.ts.net`)와 새 초대 링크가 나와요. 설치 후 `rm -rf healthlingo healthlingo-server.tar.gz`로 업로드한 파일을 지우세요.
+
+**4. 마무리 (직접 해야 해요)**
+- Google Cloud 콘솔 → OAuth 클라이언트 → **승인된 JavaScript 원본**에 새 공개 주소를 추가하세요.
+- 팀원에게 **새 초대 링크**를 보내세요(주소가 바뀌어 예전 링크는 이 서버로 연결되지 않아요).
+- PC 쪽 공개를 끄세요. 두 곳에 따로 기록이 쌓이지 않게 하려는 거예요.
+  ```powershell
+  & "$env:ProgramFiles\Tailscale\tailscale.exe" funnel reset
+  ```
+
+**서버 관리 (VM의 SSH 창에서)**
+```bash
+sudo systemctl status healthlingo        # 상태
+sudo journalctl -u healthlingo -f        # 로그
+sudo systemctl restart healthlingo       # 재시작 (.env 수정 후)
+sudo nano /opt/healthlingo/.env          # 설정 수정
+cd /opt/healthlingo
+sudo -u healthlingo .venv/bin/python run.py --show-invite         # 초대 링크
+sudo -u healthlingo .venv/bin/python run.py --allow 팀원@gmail.com  # 허용 계정 추가
+sudo -u healthlingo .venv/bin/python run.py --backup              # 백업 → /opt/healthlingo/backups/
+```
+- 백업 파일은 SSH 창의 **파일 다운로드**로 PC에 받아 두세요(경로 예: `/opt/healthlingo/backups/healthlingo-data-날짜.tar.gz`). 다운로드는 권한상 먼저 `sudo cp /opt/healthlingo/backups/파일 ~/ && sudo chown $USER ~/파일` 후 받으면 돼요.
+- **코드 업데이트**: PC에서 `run.py --export-server-bundle --code-only` → `dist\healthlingo-code.tar.gz`를 올리고 `tar xzf healthlingo-code.tar.gz && sudo bash healthlingo/deploy/setup_server.sh`. 서버의 기록과 `.env`는 그대로 유지돼요.
+- 서버 기록을 PC 번들 데이터로 바꾸고 싶을 때만 `--replace-data`를 붙이세요(기존 데이터는 `data.bak-날짜`로 보관돼요).
 
 ## 동작 요약
 

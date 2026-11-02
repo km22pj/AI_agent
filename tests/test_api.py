@@ -804,6 +804,50 @@ class AccessControlTests(ServerTestCase):
         status, body = c.post("/api/auth/logout")
         self.assertEqual((status, body["error"]["code"]), (403, "csrf"))
 
+    def test_allow_list_edits_apply_without_restart(self):
+        import os as _os
+
+        env_file = self.tmp / "test.env"
+        env_file.write_text(f"GEMINI_API_KEY=keep-me\nHEALTHLINGO_ALLOWED_EMAILS={ALLOWED}\n", encoding="utf-8")
+        self.stop_server()
+        self.start_server(env_file=env_file)
+        teammate = "teammate@example.com"
+
+        def bump(text):
+            env_file.write_text(text, encoding="utf-8")
+            stamp = time.time() + 5
+            _os.utime(env_file, (stamp, stamp))  # make sure the change is visible even on coarse clocks
+
+        c = self.invited()
+        status, body = c.post("/api/auth/google", {"credential": google_token(teammate)})
+        self.assertEqual(status, 403)
+        self.assertIn(teammate, body["error"]["message"])  # the person sees which address to send to the owner
+
+        bump(f"GEMINI_API_KEY=keep-me\nHEALTHLINGO_ALLOWED_EMAILS={ALLOWED}, Teammate@Example.com\n")
+        self.assertEqual(c.post("/api/auth/google", {"credential": google_token(teammate)})[0], 200)
+        self.assertEqual(c.get("/api/me")[0], 200)
+
+        bump(f"GEMINI_API_KEY=keep-me\nHEALTHLINGO_ALLOWED_EMAILS={ALLOWED}\n")
+        status, body = c.get("/api/me")
+        self.assertEqual((status, body["error"]["code"]), (403, "not_invited"))
+
+    def test_without_allow_list_any_google_account_signs_in(self):
+        self.stop_server()
+        self.start_server(allowed_emails=[])  # invite link still required
+        self.assertEqual(Client(self.base).post("/api/auth/google", {"credential": google_token("anyone@example.com")})[1]["error"]["code"], "invite_required")
+        c = self.invited()
+        for email in ("anyone@example.com", "another.person@gmail.com"):
+            status, body = c.post("/api/auth/google", {"credential": google_token(email)})
+            self.assertEqual(status, 200, body)
+            self.assertEqual(c.get("/api/me")[1]["user"]["email"], email)
+        self.assertFalse(c.get("/api/config")[1]["allow_list"])
+
+    def test_unverified_email_gets_its_own_message(self):
+        c = self.invited()
+        status, body = c.post("/api/auth/google", {"credential": google_token(ALLOWED, verified=False)})
+        self.assertEqual(status, 403)
+        self.assertIn("인증", body["error"]["message"])
+
     def test_invite_code_is_hidden_in_request_logs(self):
         from backend.app import INVITE_IN_LOG
 
@@ -817,6 +861,19 @@ class ExposureSettingsTests(unittest.TestCase):
         self.assertFalse(Settings(dev_login=True, public_url=PUBLIC).dev_login_allowed)
         self.assertFalse(Settings(dev_login=True, invite_code=INVITE).dev_login_allowed)
         self.assertFalse(Settings(dev_login=True, host="0.0.0.0").dev_login_allowed)
+
+    def test_env_helpers_edit_only_their_key(self):
+        from backend.config import parse_emails, read_env_value, set_env_value
+
+        path = Path(tempfile.mkdtemp()) / ".env"
+        path.write_text("# comment\nGEMINI_API_KEY=secret-value\n# HEALTHLINGO_ALLOWED_EMAILS=old@x.com\nHEALTHLINGO_ALLOWED_EMAILS=\"A@x.com, b@y.com\"\n", encoding="utf-8")
+        self.assertEqual(parse_emails(read_env_value(path, "HEALTHLINGO_ALLOWED_EMAILS")), ["a@x.com", "b@y.com"])
+        set_env_value(path, "HEALTHLINGO_ALLOWED_EMAILS", "a@x.com,b@y.com,c@z.com")
+        text = path.read_text(encoding="utf-8")
+        self.assertIn("GEMINI_API_KEY=secret-value", text)
+        self.assertIn("# HEALTHLINGO_ALLOWED_EMAILS=old@x.com", text)  # commented line kept as-is
+        self.assertEqual(read_env_value(path, "HEALTHLINGO_ALLOWED_EMAILS"), "a@x.com,b@y.com,c@z.com")
+        self.assertEqual(text.count("HEALTHLINGO_ALLOWED_EMAILS=a@x.com"), 1)
 
     def test_public_url_normalized(self):
         from backend.config import normalize_origin

@@ -20,7 +20,7 @@ from urllib.parse import parse_qs, urlsplit
 
 from . import auth
 from .ai import AIError, AINotConfigured, AIService, build_ai_service
-from .config import PROJECT_ROOT, Settings
+from .config import PROJECT_ROOT, Settings, parse_emails, read_env_value
 from .db import Database, dumps, loads, now_iso
 from .logic import (
     COUNTED_STATUSES,
@@ -246,6 +246,8 @@ class App:
             R("GET", r"/api/overview", self.overview),
         ]
         self.secret = self._load_secret()
+        self._allow_lock = threading.Lock()
+        self._allow_mtime: float | None = None
         self.cleanup_orphan_photos()
         self.db.close_thread_connection()
 
@@ -353,10 +355,29 @@ class App:
             if urlsplit(origin).netloc.lower() not in {a.lower() for a in allowed if a}:
                 raise HTTPError(403, "csrf", "허용되지 않은 요청 출처예요.")
 
+    def _allowed_emails(self) -> list[str]:
+        """Current allow list. Edits to .env take effect without restarting the server."""
+        path = self.settings.env_file
+        if path is None:
+            return self.settings.allowed_emails
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            return self.settings.allowed_emails
+        with self._allow_lock:
+            if mtime != self._allow_mtime:
+                new = parse_emails(read_env_value(path, "HEALTHLINGO_ALLOWED_EMAILS") or "")
+                if self._allow_mtime is not None and new != self.settings.allowed_emails:
+                    log.info("Allow list reloaded from .env: %d account(s)", len(new))
+                self.settings.allowed_emails = new
+                self._allow_mtime = mtime
+            return self.settings.allowed_emails
+
     def _email_allowed(self, email: str | None, is_dev) -> bool:
-        if not self.settings.allowed_emails or is_dev:
+        allowed = self._allowed_emails()
+        if not allowed or is_dev:
             return True
-        return bool(email) and email.lower() in self.settings.allowed_emails
+        return bool(email) and email.lower() in allowed
 
     # ------------------------------------------------------------ auth
 
@@ -366,7 +387,7 @@ class App:
             "google_configured": bool(self.settings.google_client_id),
             "dev_login_enabled": self.settings.dev_login_allowed,
             "invite_only": bool(self.settings.invite_code),
-            "allow_list": bool(self.settings.allowed_emails),
+            "allow_list": bool(self._allowed_emails()),
             "ai_configured": self.ai.configured,
             "ai_provider": self.settings.ai_provider,
             "ai_provider_name": "Google Gemini" if self.settings.ai_provider == "gemini" else "Anthropic Claude",
@@ -408,11 +429,18 @@ class App:
             claims = auth.verify_google_id_token(credential, self.settings.google_client_id, self.keys)
         except auth.AuthError as exc:
             raise HTTPError(401, "google_rejected", str(exc)) from exc
-        if self.settings.allowed_emails:
-            email = str(claims.get("email") or "").lower()
-            if claims.get("email_verified") is not True or email not in self.settings.allowed_emails:
-                log.info("Sign-in refused for an account that is not on the allow list")
-                raise HTTPError(403, "not_invited", f"이 Google 계정({email or '이메일 없음'})은 초대 목록에 없어요. 초대한 사람에게 계정 추가를 요청하거나, 초대받은 계정으로 로그인해 주세요.")
+        allowed = self._allowed_emails()
+        if allowed:
+            email = str(claims.get("email") or "").strip().lower()
+            verified = claims.get("email_verified") in (True, "true")
+            if email not in allowed:
+                # Shown in the server window so the owner knows exactly which address to add.
+                log.warning("로그인 거절: %s 은(는) 허용 목록에 없어요. 추가하려면: .venv\\Scripts\\python.exe run.py --allow %s",
+                            email or "(이메일 없음)", email or "<이메일>")
+                raise HTTPError(403, "not_invited", f"이 Google 계정({email or '이메일 없음'})은 초대 목록에 없어요. 초대한 사람에게 이 이메일 주소를 알려 추가를 요청하거나, 초대받은 계정으로 로그인해 주세요.")
+            if not verified:
+                log.warning("로그인 거절: %s 은(는) Google에서 이메일 인증이 안 된 계정이에요.", email)
+                raise HTTPError(403, "not_invited", f"이 Google 계정({email})은 이메일 인증이 완료되지 않았어요. Google 계정에서 이메일 인증을 마친 뒤 다시 로그인해 주세요.")
         user_id = auth.upsert_user(
             self.db,
             sub="google:" + str(claims["sub"]),

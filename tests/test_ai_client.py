@@ -334,6 +334,29 @@ class ProviderSelectionTests(unittest.TestCase):
             service.recognize(b"x", "image/jpeg")
         self.assertIn("GEMINI_API_KEY", ctx.exception.message)
 
+    def test_dotenv_wins_over_stale_terminal_copy(self):
+        """VS Code copies .env into terminals when they open; the file must still win afterwards."""
+        import tempfile
+        from pathlib import Path
+        from unittest import mock
+
+        from backend import config
+
+        root = Path(tempfile.mkdtemp())
+        (root / ".env").write_text(
+            "GEMINI_API_KEY=new-key\n# HEALTHLINGO_ALLOWED_EMAILS=old@x.com\nHEALTHLINGO_INVITE_CODE=new-code-123456789\n",
+            encoding="utf-8",
+        )
+        stale = {"GEMINI_API_KEY": "old-key", "HEALTHLINGO_ALLOWED_EMAILS": "old@x.com", "HEALTHLINGO_INVITE_CODE": "old-code"}
+        clean = {k: v for k, v in os.environ.items() if k not in self.ENV_KEYS and not k.startswith("HEALTHLINGO_")}
+        with mock.patch.dict(os.environ, {**clean, **stale}, clear=True), mock.patch.object(config, "PROJECT_ROOT", root):
+            s = config.Settings.from_env()
+            self.assertEqual(os.environ["GEMINI_API_KEY"], "new-key")
+        self.assertEqual(s.allowed_emails, [])  # commented out in .env -> really off
+        self.assertEqual(s.invite_code, "new-code-123456789")
+        self.assertEqual(s.env_file, root / ".env")
+        self.assertEqual(s.env_notes, ["GEMINI_API_KEY", "HEALTHLINGO_ALLOWED_EMAILS", "HEALTHLINGO_INVITE_CODE"])
+
     def test_claude_still_selectable(self):
         s = self.settings(HEALTHLINGO_AI_PROVIDER="anthropic", ANTHROPIC_API_KEY="x")
         self.assertEqual((s.ai_provider, s.ai_model, s.ai_key_name), ("anthropic", "claude-opus-5-5", "ANTHROPIC_API_KEY"))
