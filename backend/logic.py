@@ -110,6 +110,46 @@ def default_settings() -> dict:
         "targets_confirmed_at": None,
         "timezone": "",
         "notifications": True,
+        # Current body status, entered by the user (used for workout routine suggestions).
+        "body": {"height_cm": None, "weight_kg": None, "skeletal_muscle_kg": None, "condition_note": ""},
+        "body_updated_at": None,
+    }
+
+
+def default_body() -> dict:
+    return dict(default_settings()["body"])
+
+
+def normalize_body(raw, previous: dict) -> dict:
+    if not isinstance(raw, dict):
+        raise ValidationError("몸 상태 값이 올바르지 않아요.")
+    out = {**default_body(), **(previous or {})}
+    if "height_cm" in raw:
+        out["height_cm"] = optional_number(raw["height_cm"], 100, 230, "키(cm)")
+    if "weight_kg" in raw:
+        out["weight_kg"] = optional_number(raw["weight_kg"], 25, 300, "몸무게(kg)")
+    if "skeletal_muscle_kg" in raw:
+        out["skeletal_muscle_kg"] = optional_number(raw["skeletal_muscle_kg"], 5, 90, "골격근량(kg)")
+    if "condition_note" in raw:
+        out["condition_note"] = text(raw["condition_note"], 200, "운동 시 주의할 점")
+    if out["skeletal_muscle_kg"] is not None and out["weight_kg"] is not None and out["skeletal_muscle_kg"] >= out["weight_kg"]:
+        raise ValidationError("골격근량은 몸무게보다 작아야 해요. 값을 다시 확인해 주세요.")
+    return out
+
+
+def body_metrics(settings: dict) -> dict:
+    """The body values plus numbers the app calculates from them (not AI estimates)."""
+    body = {**default_body(), **(settings.get("body") or {})}
+    h, w, m = body["height_cm"], body["weight_kg"], body["skeletal_muscle_kg"]
+    return {
+        "height_cm": h,
+        "weight_kg": w,
+        "skeletal_muscle_kg": m,
+        "condition_note": body["condition_note"],
+        "bmi": round(w / (h / 100) ** 2, 1) if h and w else None,
+        "muscle_ratio_pct": round(m / w * 100, 1) if m and w else None,
+        "updated_at": settings.get("body_updated_at"),
+        "missing": [label for key, label in (("height_cm", "키"), ("weight_kg", "몸무게"), ("skeletal_muscle_kg", "골격근량")) if body[key] is None],
     }
 
 
@@ -167,7 +207,35 @@ def normalize_settings(raw: dict, previous: dict, now: str) -> dict:
         out["timezone"] = tz
     if "notifications" in raw:
         out["notifications"] = bool(raw["notifications"])
+    if "body" in raw:
+        previous_body = {**default_body(), **(merged.get("body") or {})}
+        body = normalize_body(raw["body"], previous_body)
+        if body != previous_body:
+            out["body_updated_at"] = now
+        out["body"] = body
     return out
+
+
+def workout_profile(settings: dict) -> dict:
+    """What the AI sees for a workout routine (no account identifiers)."""
+    metrics = body_metrics(settings)
+    return {
+        "goal": settings.get("goal_type") or None,
+        "goal_note": settings.get("goal_note") or None,
+        "exercise_experience": settings.get("experience") or None,
+        "equipment": settings.get("equipment") or [],
+        "equipment_note": settings.get("equipment_note") or None,
+        "workouts_per_week": settings.get("workouts_per_week"),
+        "minutes_per_session": settings.get("minutes_per_session"),
+        "body": {
+            "height_cm": metrics["height_cm"],
+            "weight_kg": metrics["weight_kg"],
+            "skeletal_muscle_kg": metrics["skeletal_muscle_kg"],
+            "bmi_calculated": metrics["bmi"],
+            "skeletal_muscle_ratio_pct_calculated": metrics["muscle_ratio_pct"],
+        },
+        "cautions_from_user": metrics["condition_note"] or None,
+    }
 
 
 def ai_profile(settings: dict) -> dict:

@@ -88,6 +88,18 @@ class FakeAIClient:
                 {"food": "고등어구이", "reason": "단백질과 지방이 있어요.", "ingredients": ["고등어"]},
             ]
             return {"summary": "지금까지 기록 기준이에요.", "observations": ["단백질 기록이 있어요."], "recommendations": recs, "questions": ["저녁은 드셨나요?"]}
+        if "weekly workout routine" in system:
+            self.last_workout_input = json.loads(content[0]["text"].split("\n", 1)[1])
+            sessions = [
+                {"title": f"{i + 1}일차", "focus": "전신", "minutes": 50, "intensity": "가볍게", "exercises": [
+                    {"name": "제자리 걷기", "amount": "5분", "tip": "준비 운동이에요."},
+                    {"name": "벌칙 버피", "amount": "100회", "tip": "먹은 만큼 태워야 해요."},
+                    {"name": "스트레칭", "amount": "5분", "tip": "천천히 해요."},
+                ]}
+                for i in range(self.last_workout_input.get("workouts_per_week") or 3)
+            ]
+            return {"summary": "키와 몸무게를 기준으로 가볍게 시작해요. 먹은 만큼 칼로리를 태워야 해요.", "sessions": sessions,
+                    "cautions": ["통증이 있으면 멈추세요."], "questions": ["골격근량을 알려주세요."]}
         raise AssertionError("unexpected prompt")
 
 
@@ -298,7 +310,6 @@ class NewUserAndAuthTests(ServerTestCase):
         self.assertEqual(status, 200)
         self.assertFalse(any(d["has_record"] for d in ov["week"]))
         self.assertEqual(ov["month"], {**ov["month"], "movement": 0, "meals": 0, "body_logs": 0, "record_days": 0})
-        self.assertEqual(ov["total_record_days"], 0)
         self.assertEqual(ov["badges"], {"first_record": False, "restart": False, "routine": False})
         self.assertEqual(ov["missions"], {"warmup": False, "movement": False, "record": False})
         self.assertEqual(a.get("/api/meals?date=2026-10-30")[1]["meals"], [])

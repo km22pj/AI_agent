@@ -121,6 +121,46 @@ COACH_SCHEMA = {
     "additionalProperties": False,
 }
 
+INTENSITIES = ["가볍게", "보통", "조금 힘들게"]
+
+WORKOUT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "summary": {"type": "string"},
+        "sessions": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string"},
+                    "focus": {"type": "string"},
+                    "minutes": {"type": "integer"},
+                    "intensity": {"type": "string", "enum": INTENSITIES},
+                    "exercises": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "name": {"type": "string"},
+                                "amount": {"type": "string"},
+                                "tip": {"type": "string"},
+                            },
+                            "required": ["name", "amount", "tip"],
+                            "additionalProperties": False,
+                        },
+                    },
+                },
+                "required": ["title", "focus", "minutes", "intensity", "exercises"],
+                "additionalProperties": False,
+            },
+        },
+        "cautions": {"type": "array", "items": {"type": "string"}},
+        "questions": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["summary", "sessions", "cautions", "questions"],
+    "additionalProperties": False,
+}
+
 # ---------------------------------------------------------------- prompts
 
 RECOGNITION_SYSTEM = """You identify the foods in one meal photo for a Korean food-journal app.
@@ -155,6 +195,20 @@ You receive the user's profile (goals, food preferences, allergies, foods to avo
 - recommendations: 2-4 concrete foods for the next meal (or tomorrow if the day is complete), each with a reason tied to the data. List the main ingredients of each food in ingredients. Never include the user's allergens or foods they avoid, and respect their preferences.
 - questions: ask for whatever information is missing to give better advice (up to 3).
 - Never suggest skipping meals, fasting, very low calorie intake, or punishment/compensation exercise. Do not label foods as good or bad."""
+
+WORKOUT_SYSTEM = """You suggest a gentle, personalized weekly workout routine in a Korean health-journal app.
+Write every human-readable string in Korean.
+
+You receive the user's current body values (height, weight, skeletal muscle mass if known, and BMI / skeletal-muscle ratio that the app calculated), goal, exercise experience, available equipment, how many times a week and how many minutes per session they can work out, and any cautions they wrote (pain, injuries).
+
+- summary: 2-3 sentences explaining why this routine fits, tied to the provided numbers and goal. Do not diagnose, and do not label the body as good/bad or comment on appearance. BMI does not reflect muscle mass; say so if you use it.
+- sessions: one entry per workout day, titled "1일차", "2일차", ... Use workouts_per_week if given (otherwise 3). Each session's minutes must not exceed minutes_per_session if given (otherwise 30). Each session starts with a warm-up and ends with a cool-down/stretch inside its exercises.
+- Only use the listed equipment (bodyweight is always allowed). Match difficulty to experience; for beginners or when experience is unknown, choose easy, low-impact movements.
+- If the user wrote cautions, avoid movements that load those areas and mention it.
+- amount: sets x reps, or minutes, e.g. "2세트 × 10회", "5분". tip: one short form or safety tip.
+- cautions: 2-4 short safety notes (e.g. stop if there is pain, consult a professional for medical conditions).
+- questions: ask for missing information that would improve the routine (up to 3), e.g. skeletal muscle mass if it is missing.
+- Never suggest punishment or compensation exercise (e.g. to burn off food), exercising through pain, extreme volume, or skipping meals."""
 
 # ---------------------------------------------------------------- safety helpers
 
@@ -329,6 +383,65 @@ def validate_coach(data, blocked_terms: list[str]) -> dict:
     }
 
 
+def validate_workout(data, max_minutes: int | None = None) -> dict:
+    if not isinstance(data, dict):
+        raise _invalid("workout not object")
+    raw_sessions = data.get("sessions")
+    if not isinstance(raw_sessions, list) or not raw_sessions:
+        raise _invalid("sessions missing")
+    sessions = []
+    removed = 0
+    for raw in raw_sessions[:7]:
+        if not isinstance(raw, dict):
+            raise _invalid("session not object")
+        intensity = raw.get("intensity")
+        if intensity not in INTENSITIES:
+            raise _invalid("intensity not allowed")
+        minutes = int(_number(raw.get("minutes"), 5, 240, "minutes"))
+        if max_minutes:
+            minutes = min(minutes, max_minutes)
+        exercises_raw = raw.get("exercises")
+        if not isinstance(exercises_raw, list):
+            raise _invalid("exercises not list")
+        exercises = []
+        for ex in exercises_raw[:10]:
+            if not isinstance(ex, dict):
+                raise _invalid("exercise not object")
+            item = {
+                "name": _clean_str(ex.get("name"), 60, "name", allow_empty=False),
+                "amount": _clean_str(ex.get("amount"), 40, "amount"),
+                "tip": _clean_str(ex.get("tip"), 160, "tip"),
+            }
+            if any(pat in item["name"] or pat in item["tip"] for pat in UNSAFE_PATTERNS):
+                removed += 1
+                continue
+            exercises.append(item)
+        if not exercises:
+            continue
+        sessions.append({
+            "title": _clean_str(raw.get("title"), 40, "title", allow_empty=False),
+            "focus": _clean_str(raw.get("focus"), 60, "focus"),
+            "minutes": minutes,
+            "intensity": intensity,
+            "exercises": exercises,
+        })
+    if not sessions:
+        raise _invalid("no usable sessions")
+    summary, _ = strip_unsafe_sentences(_clean_str(data.get("summary"), 500, "summary"))
+    cautions = []
+    for text in _clean_str_list(data.get("cautions"), 5, 200, "cautions"):
+        cleaned, _ = strip_unsafe_sentences(text)
+        if cleaned:
+            cautions.append(cleaned)
+    return {
+        "summary": summary,
+        "sessions": sessions,
+        "cautions": cautions,
+        "filtered_exercises": removed,
+        "questions": _clean_str_list(data.get("questions"), 3, 160, "questions"),
+    }
+
+
 # ---------------------------------------------------------------- client
 
 class AnthropicJSONClient:
@@ -404,7 +517,7 @@ class GeminiJSONClient:
     """
 
     # Recognizing foods in a photo needs little reasoning; estimates and coaching a bit more.
-    THINKING = {"recognize": "minimal", "estimate": "low", "coach": "low"}
+    THINKING = {"recognize": "minimal", "estimate": "low", "coach": "low", "workout": "low"}
     FALLBACK_CODES = {"ai_unavailable", "ai_timeout", "ai_rate_limited", "ai_model", "ai_truncated"}
     COOLDOWN_SECONDS = 300
 
@@ -583,6 +696,11 @@ class AIService:
         content = [{"type": "text", "text": "이 날의 식사 기록을 바탕으로 피드백과 추천을 주세요.\n" + json.dumps(payload, ensure_ascii=False)}]
         data, model = self._ask(COACH_SYSTEM, content, COACH_SCHEMA, "coach")
         return {**validate_coach(data, blocked_terms), "model": model}
+
+    def workout(self, profile: dict) -> dict:
+        content = [{"type": "text", "text": "다음 정보를 바탕으로 이번 주 운동 루틴을 추천해 주세요.\n" + json.dumps(profile, ensure_ascii=False)}]
+        data, model = self._ask(WORKOUT_SYSTEM, content, WORKOUT_SCHEMA, "workout")
+        return {**validate_workout(data, profile.get("minutes_per_session")), "model": model}
 
 
 def build_ai_service(settings) -> AIService:

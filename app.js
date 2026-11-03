@@ -65,10 +65,12 @@
     flow: freshFlow(),
     body: freshBody(),
     gallery: freshGallery(),
+    workout: freshWorkout(),
     mealForm: null,
     bodyForm: null,
     analyzing: new Set(),
   };
+  function freshWorkout() { return { data: null, token: 0, error: null, busy: false, requestError: null }; }
   function freshFood() { return { date: null, token: 0, day: null, stats: null, error: null, coachBusy: false, coachError: null }; }
   function freshFlow() { return { token: 0, status: "idle", prepared: null, clientId: null, photo: null, recognition: null, error: null }; }
   function freshBody() { return { month: null, selected: null, logsByDate: new Map(), token: 0, loaded: false, error: null }; }
@@ -108,6 +110,7 @@
     } catch { return iso; }
   }
   const fmtNum = (v) => Math.round(v).toLocaleString("ko-KR");
+  const fmt1 = (v) => Number(v).toLocaleString("ko-KR", { maximumFractionDigits: 1 }); // body values like 58.5kg
 
   function guessMealType(time) {
     if (!time) return "";
@@ -448,11 +451,13 @@
     state.flow = freshFlow();
     state.body = freshBody();
     state.gallery = freshGallery();
+    state.workout = freshWorkout();
     state.mealForm = null;
     state.bodyForm = null;
     state.analyzing = new Set();
-    ["#meal-list", "#nutrition-body", "#trend-body", "#coach-body", "#food-flow", "#calendar-grid", "#body-day", "#settings-summary", "#week-days", "#view-dialog-body", "#view-dialog-foot"].forEach((sel) => $(sel).replaceChildren());
-    ["#meal-count", "#meal-analyzed-count", "#meal-pending-count", "#stat-movement", "#stat-meals", "#stat-body", "#stat-days", "#token-count"].forEach((sel) => { $(sel).textContent = "–"; });
+    ["#meal-list", "#nutrition-body", "#trend-body", "#coach-body", "#food-flow", "#calendar-grid", "#body-day", "#settings-summary", "#week-days", "#view-dialog-body", "#view-dialog-foot", "#routine-body"].forEach((sel) => $(sel).replaceChildren());
+    ["#meal-count", "#meal-analyzed-count", "#meal-pending-count", "#stat-movement", "#stat-meals", "#stat-body", "#stat-days", "#streak-days"].forEach((sel) => { $(sel).textContent = "–"; });
+    $("#streak-copy").textContent = "기록을 불러오는 중이에요…";
     $("#sidebar-name").textContent = "나의 프로필";
     $("#sidebar-email").textContent = "로그인 필요";
     $("#sidebar-avatar").replaceChildren("🌼");
@@ -487,6 +492,7 @@
       if (!state.body.month) state.body.month = todayStr().slice(0, 8) + "01";
       loadBodyMonth();
       loadComparePreview();
+      loadWorkout();
     }
   }
 
@@ -542,18 +548,31 @@
     $("#week-summary-text").textContent = ov.week_record_days
       ? `이번 주에 ${ov.week_record_days}일 나를 위한 기록을 남겼어요.`
       : "이번 주 기록이 아직 없어요. 오늘 하나 남겨 볼까요?";
+    renderStreak(ov.streak);
     renderMissions(ov.missions);
 
     $("#stat-movement").textContent = `${ov.month.movement}회`;
     $("#stat-meals").textContent = `${ov.month.meals}회`;
     $("#stat-body").textContent = `${ov.month.body_logs}회`;
     $("#stat-days").textContent = `${ov.month.record_days}일`;
-    $("#token-count").textContent = String(ov.total_record_days * 10);
     $$(".badge-card[data-badge]").forEach((card) => {
       const earned = Boolean(ov.badges[card.dataset.badge]);
       card.classList.toggle("locked", !earned);
       card.setAttribute("aria-label", `${card.querySelector("strong").textContent} ${earned ? "획득" : "아직 잠김"}`);
     });
+  }
+
+  function renderStreak(streak) {
+    if (!streak) return;
+    const { current, best, today_recorded: todayDone } = streak;
+    $("#streak-days").textContent = String(current);
+    $("#streak-title").textContent = current
+      ? todayDone ? `오늘까지 ${current}일 연속으로 기록했어요` : `어제까지 ${current}일 연속으로 기록했어요`
+      : "연속 기록";
+    const bestText = best > current ? ` 지금까지 가장 길게 이어간 기록은 ${best}일이에요.` : "";
+    $("#streak-copy").textContent = current
+      ? (todayDone ? "식사·바디 로그·오늘의 목표 중 하나라도 남긴 날이 이어지면 늘어나요." :`오늘 기록하면 ${current + 1}일째가 돼요.`) + bestText
+      : (best ? `오늘 기록하면 새 연속 기록이 시작돼요.${bestText}` : "오늘 기록하면 연속 기록이 시작돼요.");
   }
 
   function renderMissions(missions) {
@@ -612,7 +631,8 @@
   function settingsAreEmpty(s) {
     if (!s) return true;
     const targets = s.targets || {};
-    return !s.goal_type && !s.experience && !(s.allergies || []).length && !(s.avoid_foods || []).length && !Object.values(targets).some((v) => v != null) && !s.food_preferences;
+    const body = s.body || {};
+    return !s.goal_type && !s.experience && !(s.allergies || []).length && !(s.avoid_foods || []).length && !Object.values(targets).some((v) => v != null) && !s.food_preferences && body.height_cm == null && body.weight_kg == null;
   }
 
   function renderProfile() {
@@ -629,6 +649,7 @@
     const targetText = NUTRIENTS.filter(([k]) => t[k] != null).map(([k, label, unit]) => `${label} ${fmtNum(t[k])}${unit}`).join(" · ");
     const rows = [
       ["목표", goal || "설정 안 함"],
+      ["현재 몸 상태", bodyText(s.body) || "설정 안 함"],
       ["운동 경험", s.experience || "설정 안 함"],
       ["사용 가능한 장비", [...(s.equipment || []), s.equipment_note].filter(Boolean).join(", ") || "설정 안 함"],
       ["운동 계획", s.workouts_per_week != null || s.minutes_per_session != null ? `주 ${s.workouts_per_week ?? "?"}회 · ${s.minutes_per_session ?? "?"}분` : "설정 안 함"],
@@ -642,10 +663,24 @@
     renderMissions(state.overview ? state.overview.missions : null);
   }
 
+  function bodyText(body) {
+    const b = body || {};
+    return [
+      b.height_cm != null ? `키 ${fmt1(b.height_cm)}cm` : null,
+      b.weight_kg != null ? `몸무게 ${fmt1(b.weight_kg)}kg` : null,
+      b.skeletal_muscle_kg != null ? `골격근량 ${fmt1(b.skeletal_muscle_kg)}kg` : null,
+    ].filter(Boolean).join(" · ");
+  }
+
   // ------------------------------------------------------------------ settings form
-  function openSettings() {
+  function openSettings({ focus = null } = {}) {
     const s = state.settings;
     if (!s) return;
+    const body = s.body || {};
+    $("#set-height").value = body.height_cm ?? "";
+    $("#set-weight").value = body.weight_kg ?? "";
+    $("#set-muscle").value = body.skeletal_muscle_kg ?? "";
+    $("#set-condition").value = body.condition_note || "";
     $("#set-goal").value = s.goal_type || "";
     $("#set-experience").value = s.experience || "";
     $("#set-goal-note").value = s.goal_note || "";
@@ -667,6 +702,10 @@
     $("#set-timezone").textContent = `기록 날짜는 ${userTz()} 시간대 기준으로 계산해요.` + (s.targets_confirmed_at ? ` · 영양 목표 확인: ${fmtStamp(s.targets_confirmed_at)}` : "");
     showFormError("#settings-form-error", "");
     openDialog($("#settings-dialog"));
+    if (focus) {
+      $("#set-body-section").scrollIntoView({ block: "start" });
+      $(focus).focus({ preventScroll: true });
+    }
   }
 
   const numOrNull = (sel) => { const v = $(sel).value.trim(); return v === "" ? null : Number(v); };
@@ -686,6 +725,7 @@
       allergies: $("#set-allergies").value,
       avoid_foods: $("#set-avoid").value,
       targets: { kcal: numOrNull("#set-kcal"), carbs_g: numOrNull("#set-carbs"), protein_g: numOrNull("#set-protein"), fat_g: numOrNull("#set-fat") },
+      body: { height_cm: numOrNull("#set-height"), weight_kg: numOrNull("#set-weight"), skeletal_muscle_kg: numOrNull("#set-muscle"), condition_note: $("#set-condition").value },
     };
     await withBusy($("#settings-save"), "저장 중", async () => {
       try {
@@ -696,6 +736,7 @@
         renderProfile();
         notify("개인 설정을 저장했어요.");
         if (state.food.date && $("#screen-food").classList.contains("active")) loadFoodDay({ keep: true });
+        if ($("#screen-body").classList.contains("active")) loadWorkout();
       } catch (error) {
         showFormError("#settings-form-error", error.message);
       }
@@ -1831,29 +1872,133 @@
     $("#compare-preview").replaceChildren(h("div", { class: "compare-frame" }, h("span", { text: "첫 기록" })), h("div", { class: "compare-frame" }, h("span", { text: "최근 기록" })));
   }
 
+  let comparePreviewToken = 0;
   async function loadComparePreview() {
     const epoch = state.epoch;
+    const token = ++comparePreviewToken; // only the newest request may update the preview
+    const current = () => epoch === state.epoch && token === comparePreviewToken;
     try {
       const res = await api("/api/body-logs?order=asc");
-      if (epoch !== state.epoch) return;
+      if (!current()) return;
       const logs = res.body_logs;
       const withPhoto = logs.filter((l) => l.photo);
       if (withPhoto.length >= 2) {
         const first = withPhoto[0];
         const latest = withPhoto[withPhoto.length - 1];
         $("#compare-preview").replaceChildren(compareFrame(first, "첫 기록"), compareFrame(latest, "최근 기록"));
+      } else if (withPhoto.length === 1) {
+        // Show the only photo right away instead of waiting for a second one.
+        $("#compare-preview").replaceChildren(
+          compareFrame(withPhoto[0], "첫 기록"),
+          h("div", { class: "compare-frame" }, h("div", { style: "padding:0 12px;text-align:center" }, h("span", { text: "최근 기록" }), h("p", { style: "margin:8px 0 0;line-height:1.5", text: "사진을 하나 더 올리면 여기에 보여요" }))),
+        );
       } else {
         resetComparePreview();
       }
       $("#compare-note").textContent = !logs.length
         ? "아직 저장된 기록이 없어요. 첫 기록을 남기면 여기서 모아 볼 수 있어요."
-        : withPhoto.length < 2
-          ? `저장된 기록 ${logs.length}개 · 사진이 있는 기록이 2개 이상이면 첫 기록과 최근 기록을 나란히 보여드려요. (현재 ${withPhoto.length}개)`
-          : `저장된 기록 ${logs.length}개 · 사진이 있는 첫 기록과 최근 기록이에요. 원하는 두 기록을 골라 비교할 수도 있어요.`;
+        : !withPhoto.length
+          ? `저장된 기록 ${logs.length}개 · 사진을 올리면 여기에 바로 보여요.`
+          : withPhoto.length === 1
+            ? `저장된 기록 ${logs.length}개 · 사진이 있는 기록이 하나 더 생기면 첫 기록과 최근 기록을 나란히 보여드려요.`
+            : `저장된 기록 ${logs.length}개 · 사진이 있는 첫 기록과 최근 기록이에요. 원하는 두 기록을 골라 비교할 수도 있어요.`;
     } catch (error) {
-      if (epoch !== state.epoch) return;
+      if (!current()) return;
       $("#compare-note").textContent = error.message;
     }
+  }
+
+  // ------------------------------------------------------------------ body: workout routine
+  async function loadWorkout() {
+    const w = state.workout;
+    const epoch = state.epoch;
+    const token = ++w.token;
+    w.error = null;
+    if (!w.data) renderRoutine();
+    try {
+      const data = await api("/api/workout-plan");
+      if (epoch !== state.epoch || token !== w.token) return;
+      w.data = data;
+    } catch (error) {
+      if (epoch !== state.epoch || token !== w.token) return;
+      w.error = error;
+    }
+    renderRoutine();
+  }
+
+  function renderRoutine() {
+    const w = state.workout;
+    const box = $("#routine-body");
+    if (w.error) { box.replaceChildren(errorNotice(w.error, loadWorkout)); return; }
+    if (!w.data) { box.replaceChildren(loadingLine("몸 상태를 불러오는 중이에요…")); return; }
+    const { body, plan } = w.data;
+    const kids = [];
+    const stat = (label, value, note) => h("div", { class: "stat-card" }, h("span", { text: label }), h("strong", { text: value }), h("small", { text: note }));
+    const v = (x, unit) => (x == null ? "–" : `${fmt1(x)}${unit}`);
+    kids.push(
+      h("div", { class: "body-stats" },
+        stat("키", v(body.height_cm, "cm"), "직접 입력"),
+        stat("몸무게", v(body.weight_kg, "kg"), "직접 입력"),
+        stat("골격근량", v(body.skeletal_muscle_kg, "kg"), body.skeletal_muscle_kg == null ? "측정값이 있으면 입력" : "직접 입력"),
+        stat("BMI", body.bmi == null ? "–" : fmt1(body.bmi), "키·몸무게로 계산"),
+        stat("골격근 비율", v(body.muscle_ratio_pct, "%"), "골격근량÷몸무게로 계산"),
+      ),
+      h("p", { class: "hint", style: "margin-top:8px", text: `${body.updated_at ? `${fmtStamp(body.updated_at)} 업데이트 · ` : ""}BMI는 근육량을 반영하지 못하는 참고 지표예요.${body.condition_note ? ` · 주의할 점: ${body.condition_note}` : ""}` }),
+    );
+    if (body.height_cm == null || body.weight_kg == null) {
+      kids.push(h("div", { style: "margin-top:12px" }, emptyState("키와 몸무게를 입력하면 운동 루틴을 추천해 드려요", "개인 설정의 ‘현재 몸 상태’에 입력할 수 있어요. 골격근량도 있으면 더 맞춤화돼요.", btn("몸 상태 입력", "mini-button accent", () => openSettings({ focus: "#set-height" })))));
+      box.replaceChildren(...kids);
+      return;
+    }
+
+    kids.push(h("p", { class: "sub-title" }, "이번 주 운동 루틴 ", h("span", { class: "tag indigo", text: "AI 추천 · 참고용" })));
+    if (!state.config.ai_configured) {
+      kids.push(h("div", { class: "notice", style: "margin-top:8px" }, `AI 분석이 설정되지 않아 운동 루틴을 추천할 수 없어요. 서버에 ${state.config.ai_key_name || "AI API 키"}를 설정하면 사용할 수 있어요.`));
+      box.replaceChildren(...kids);
+      return;
+    }
+    if (plan) {
+      if (plan.stale) kids.push(h("div", { class: "notice", style: "margin-top:8px" }, "이 루틴을 받은 뒤 몸 상태나 운동 설정이 바뀌었어요. 다시 받으면 최신 값이 반영돼요."));
+      if (plan.summary) kids.push(h("p", { style: "margin:10px 0 0;font-size:13px;line-height:1.65", text: plan.summary }));
+      kids.push(
+        h("div", { class: "session-grid" }, plan.sessions.map((s) => h("div", { class: "session-card" },
+          h("h4", { text: s.title }),
+          h("p", { class: "session-meta", text: [s.focus, `${s.minutes}분`, s.intensity].filter(Boolean).join(" · ") }),
+          h("ol", null, s.exercises.map((ex) => h("li", null, `${ex.name}${ex.amount ? ` · ${ex.amount}` : ""}`, ex.tip ? h("small", { text: ex.tip }) : null))),
+        ))),
+      );
+      if (plan.cautions.length) kids.push(h("ul", { class: "coach-list" }, plan.cautions.map((c) => h("li", { text: c }))));
+      if (plan.filtered_exercises) kids.push(h("p", { class: "hint", style: "margin-top:6px", text: `안전하지 않은 표현이 담긴 동작 ${plan.filtered_exercises}개는 제외했어요.` }));
+      if (plan.questions.length) kids.push(h("div", { class: "ai-questions", style: "margin-top:10px" }, h("strong", { text: "더 맞춤화된 루틴을 위해 알려주세요" }), h("ul", null, plan.questions.map((q) => h("li", { text: q })))));
+      kids.push(h("p", { class: "hint", style: "margin-top:8px", text: `${fmtStamp(plan.created_at)} 생성 · ${plan.model || "AI"} · 통증이 있으면 멈추고, 질환이 있다면 전문가와 먼저 상의하세요.` }));
+    } else {
+      kids.push(h("p", { class: "hint", style: "margin-top:8px", text: "몸 상태와 목표·운동 경험·장비·운동 계획을 바탕으로 이번 주 루틴을 만들어요." }));
+    }
+    if (w.requestError) kids.push(errorNotice(w.requestError, w.requestError.retryable === false ? null : requestWorkout));
+    const button = btn(w.busy ? "추천 중…" : plan ? "루틴 다시 받기" : "운동 루틴 추천 받기", "secondary-button small-button", requestWorkout, { disabled: w.busy, style: "margin-top:12px" });
+    if (w.busy) button.prepend(spinner(), " ");
+    kids.push(button);
+    box.replaceChildren(...kids);
+  }
+
+  async function requestWorkout() {
+    const w = state.workout;
+    if (w.busy) return;
+    const epoch = state.epoch;
+    w.busy = true;
+    w.requestError = null;
+    renderRoutine();
+    try {
+      const data = await api("/api/workout-plan", { method: "POST", body: {}, timeoutMs: AI_TIMEOUT_MS });
+      if (epoch !== state.epoch) return;
+      w.data = data;
+      w.token += 1; // a slower GET started earlier must not overwrite the new plan
+    } catch (error) {
+      if (epoch !== state.epoch) return;
+      w.requestError = error;
+    }
+    w.busy = false;
+    renderRoutine();
   }
 
   // ------------------------------------------------------------------ global events
@@ -1871,6 +2016,7 @@
     const action = actionEl.dataset.action;
     if (action === "logout") logout();
     else if (action === "open-settings") openSettings();
+    else if (action === "edit-body") openSettings({ focus: "#set-height" });
     else if (action === "add-meal") openMealForm({ date: state.food.date || todayStr() });
     else if (action === "add-meal-today") goToFood(todayStr(), true);
     else if (action === "body-new-photo") openBodyForm({ date: todayStr(), pickPhoto: true });
