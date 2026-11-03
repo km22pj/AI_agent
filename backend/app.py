@@ -27,6 +27,7 @@ from .logic import (
     MEAL_TYPES,
     ValidationError,
     ai_profile,
+    body_metrics,
     date_range,
     day_totals,
     default_settings,
@@ -35,6 +36,7 @@ from .logic import (
     normalize_settings,
     parse_client_id,
     parse_date,
+    workout_profile,
     parse_items,
     parse_manual_nutrition,
     parse_time,
@@ -244,6 +246,8 @@ class App:
             R("POST", r"/api/activities", self.add_activity),
             R("DELETE", r"/api/activities", self.remove_activity),
             R("GET", r"/api/overview", self.overview),
+            R("GET", r"/api/workout-plan", self.get_workout_plan),
+            R("POST", r"/api/workout-plan", self.create_workout_plan),
         ]
         self.secret = self._load_secret()
         self._allow_lock = threading.Lock()
@@ -1077,6 +1081,71 @@ class App:
             conn.execute("DELETE FROM activities WHERE user_id = ? AND date = ? AND kind = ?", (req.user["id"], day, kind))
         return Response(body={"ok": True, "date": day, "kind": kind, "done": False})
 
+    # ------------------------------------------------------------ workout routine
+
+    def _workout_hash(self, profile: dict) -> str:
+        return hashlib.sha256(dumps(profile).encode("utf-8")).hexdigest()
+
+    def _workout_payload(self, uid: int) -> dict:
+        settings = self._load_settings(uid)
+        profile = workout_profile(settings)
+        with self.db.connect() as conn:
+            row = conn.execute("SELECT * FROM workout_plans WHERE user_id = ?", (uid,)).fetchone()
+        plan = None
+        if row:
+            plan = {**loads(row["plan"]), "created_at": row["created_at"], "stale": row["input_hash"] != self._workout_hash(profile)}
+        return {"body": body_metrics(settings), "plan": plan}
+
+    def get_workout_plan(self, req: Request) -> Response:
+        return Response(body=self._workout_payload(req.user["id"]))
+
+    def create_workout_plan(self, req: Request) -> Response:
+        uid = req.user["id"]
+        settings = self._load_settings(uid)
+        metrics = body_metrics(settings)
+        if metrics["height_cm"] is None or metrics["weight_kg"] is None:
+            raise ValidationError("운동 루틴을 추천하려면 개인 설정에서 키와 몸무게를 먼저 입력해 주세요.")
+        profile = workout_profile(settings)
+        key = f"workout:{uid}"
+        self._claim(key)
+        try:
+            try:
+                plan = self.ai.workout(profile)
+            except AIError as exc:
+                raise ai_http_error(exc) from exc
+        finally:
+            self._release(key)
+        plan["model"] = plan.get("model") or self.settings.ai_model
+        with self.db.write_lock, self.db.connect() as conn:
+            conn.execute(
+                "INSERT INTO workout_plans (user_id, plan, input_hash, created_at) VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(user_id) DO UPDATE SET plan = excluded.plan, input_hash = excluded.input_hash, created_at = excluded.created_at",
+                (uid, dumps(plan), self._workout_hash(profile), now_iso()),
+            )
+        return Response(body=self._workout_payload(uid))
+
+    # ------------------------------------------------------------ overview
+
+    @staticmethod
+    def _streaks(recorded: list[str], today: date) -> dict:
+        """Consecutive record days. The current run counts up to today, or up to yesterday
+        when today has no record yet (so the run is not shown as broken before the day ends)."""
+        days = sorted({date.fromisoformat(d) for d in recorded if d <= today.isoformat()})
+        best = run = 0
+        prev = None
+        for d in days:
+            run = run + 1 if prev is not None and (d - prev).days == 1 else 1
+            best = max(best, run)
+            prev = d
+        day_set = set(days)
+        today_recorded = today in day_set
+        cursor = today if today_recorded else today - timedelta(days=1)
+        current = 0
+        while cursor in day_set:
+            current += 1
+            cursor -= timedelta(days=1)
+        return {"current": current, "best": best, "today_recorded": today_recorded}
+
     def overview(self, req: Request) -> Response:
         uid = req.user["id"]
         today = date.fromisoformat(parse_date(req.query.get("today"), "오늘 날짜"))
@@ -1117,6 +1186,7 @@ class App:
                 for d in week
             ],
             "week_record_days": sum(1 for d in week if d in recorded_set),
+            "streak": self._streaks(recorded, today),
             "missions": {
                 "warmup": any(a["date"] == today_s and a["kind"] == "warmup" for a in acts),
                 "movement": any(a["date"] == today_s and a["kind"] == "movement" for a in acts),
@@ -1130,7 +1200,6 @@ class App:
                 "body_logs": sum(1 for d in body_dates if in_month(d)),
                 "record_days": sum(1 for d in recorded if in_month(d)),
             },
-            "total_record_days": len(recorded),
             "badges": {
                 "first_record": bool(recorded),
                 "restart": restarted,

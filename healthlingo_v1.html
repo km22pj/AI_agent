@@ -297,10 +297,6 @@
     .stat-card span { display: block; color: var(--muted); font-size: 10px; }
     .stat-card strong { display: block; margin-top: 6px; font-size: 20px; letter-spacing: -.04em; }
     .stat-card small { display: block; margin-top: 2px; color: #9297a1; font-size: 9px; }
-    .reward-banner { display: flex; align-items: center; justify-content: space-between; gap: 20px; margin-top: 17px; padding: 20px 22px; background: linear-gradient(115deg, #fff9e9, #fff); }
-    .reward-banner h3 { margin: 0; font-size: 14px; }
-    .reward-banner p { margin: 5px 0 0; color: var(--muted); font-size: 11px; }
-    .token-count { display: flex; align-items: center; gap: 8px; color: #8e6e27; font-size: 20px; font-weight: 800; white-space: nowrap; }
     .badge-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 11px; }
     .badge-card { padding: 17px 10px; border: 1px solid #ededea; border-radius: 15px; background: #fdfdfb; text-align: center; }
     .badge-icon { display: grid; width: 47px; height: 47px; place-items: center; margin: 0 auto 9px; border-radius: 16px; background: var(--indigo-soft); font-size: 22px; }
@@ -361,7 +357,6 @@
       .badge-grid { gap: 7px; }
       .badge-card { padding: 13px 5px; }
       .badge-icon { width: 42px; height: 42px; }
-      .reward-banner { padding: 17px; }
       .stat-card { padding: 14px; }
       .mobile-nav {
         position: fixed;
@@ -551,6 +546,25 @@
       .flow-card img { width: 72px; height: 72px; }
       .sheet-body, .sheet-head, .sheet-foot { padding-right: 16px; padding-left: 16px; }
     }
+    /* 연속 기록 (오늘 탭) */
+    .streak-card { display: flex; align-items: center; gap: 15px; padding: 20px 22px; background: linear-gradient(140deg, #fff 45%, #fff8ec); }
+    .streak-count { display: grid; width: 73px; height: 73px; flex: 0 0 auto; place-items: center; border-radius: 22px; background: #fff1d6; color: #8e6e27; text-align: center; }
+    .streak-count strong { display: block; font-size: 24px; line-height: 1; letter-spacing: -.04em; }
+    .streak-count small { display: block; margin-top: 3px; font-size: 10px; font-weight: 700; }
+    .streak-copy strong { display: block; font-size: 13px; }
+    .streak-copy p { margin: 4px 0 0; color: var(--muted); font-size: 11px; line-height: 1.6; }
+    /* 몸 상태·운동 루틴 (바디 로그 탭) */
+    .routine-panel { margin-top: 17px; }
+    .body-stats { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 9px; }
+    .body-stats .stat-card { padding: 13px 12px; }
+    .body-stats .stat-card strong { font-size: 17px; }
+    .session-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 10px; margin-top: 10px; }
+    .session-card { padding: 13px; border: 1px solid #e5e7f4; border-radius: 14px; background: #f9f9ff; }
+    .session-card h4 { margin: 0; font-size: 13px; }
+    .session-card .session-meta { margin: 3px 0 8px; color: var(--muted); font-size: 11px; }
+    .session-card ol { display: grid; gap: 6px; margin: 0; padding-left: 18px; font-size: 12px; line-height: 1.5; }
+    .session-card ol small { display: block; color: #7b8293; font-size: 10.5px; }
+    @media (max-width: 760px) { .body-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
   </style>
 </head>
 <body class="signed-out">
@@ -681,6 +695,10 @@
                 <div class="ring" id="today-ring" aria-label="오늘 목표 진행"><span id="ring-count">0/3</span></div>
                 <div class="rhythm-copy"><strong id="rhythm-title">나만의 속도로 좋아요</strong><p id="rhythm-copy">오늘의 작은 목표를<br>하나씩 채워 봐요.</p></div>
               </section>
+              <section class="surface streak-card" aria-labelledby="streak-title">
+                <div class="streak-count" aria-hidden="true"><div><strong id="streak-days">–</strong><small>일 연속</small></div></div>
+                <div class="streak-copy"><strong id="streak-title">연속 기록</strong><p id="streak-copy">기록을 불러오는 중이에요…</p></div>
+              </section>
               <section class="surface quote-card">
                 <span class="quote-mark" aria-hidden="true">“</span>
                 <span class="tag sage">오늘의 마음</span>
@@ -738,6 +756,13 @@
               <button class="quiet-button small-button" type="button" data-action="open-compare">두 기록 비교하기</button>
             </div>
             <p class="section-note" id="compare-note">기록을 불러오는 중이에요…</p>
+          </section>
+          <section class="surface panel routine-panel" aria-labelledby="routine-title">
+            <div class="section-head">
+              <div><h2 class="section-title" id="routine-title">몸 상태 기반 운동 루틴</h2><p class="section-subtitle">개인 설정의 키·몸무게·골격근량과 운동 계획을 바탕으로 추천해요</p></div>
+              <button class="text-button" type="button" data-action="edit-body">몸 상태 수정</button>
+            </div>
+            <div id="routine-body"></div>
           </section>
         </section>
 
@@ -828,10 +853,6 @@
             <div class="stat-card"><span>이번 달 바디 로그</span><strong id="stat-body">–</strong><small>사진은 선택 사항</small></div>
             <div class="stat-card"><span>이번 달 기록한 날</span><strong id="stat-days">–</strong><small>하나라도 기록한 날</small></div>
           </div>
-          <section class="surface reward-banner">
-            <div><h3>모은 리듬 토큰</h3><p>기록을 남긴 날마다 10개씩 쌓여요.</p></div>
-            <div class="token-count"><span aria-hidden="true">✦</span><span id="token-count">–</span></div>
-          </section>
           <section class="surface panel" style="margin-top:17px">
             <div class="section-head"><div><h2 class="section-title">내가 모은 배지</h2><p class="section-subtitle">저장된 기록으로 자동으로 열려요</p></div><button class="text-button" id="badge-info" type="button">배지 안내</button></div>
             <div class="badge-grid">
@@ -948,6 +969,16 @@
             <select id="set-experience"><option value="">선택 안 함</option><option>처음이에요</option><option>6개월 미만</option><option>6개월~2년</option><option>2년 이상</option></select></div>
         </div>
         <div class="field"><label for="set-goal-note">목표 메모 (선택)</label><input type="text" id="set-goal-note" maxlength="200" placeholder="예: 계단을 숨차지 않게 오르고 싶어요"></div>
+        <div class="field" id="set-body-section">
+          <span class="label">현재 몸 상태</span>
+          <p class="hint">바디 로그의 운동 루틴 추천에 쓰여요. 골격근량은 체성분 측정(예: 인바디) 결과가 있을 때만 입력하세요. 비워 둬도 돼요.</p>
+          <div class="field-row" style="margin-top:6px">
+            <div class="field"><label for="set-height">키 (cm)</label><input type="number" id="set-height" min="100" max="230" step="0.1" inputmode="decimal" placeholder="예: 165"></div>
+            <div class="field"><label for="set-weight">몸무게 (kg)</label><input type="number" id="set-weight" min="25" max="300" step="0.1" inputmode="decimal" placeholder="예: 58.5"></div>
+            <div class="field"><label for="set-muscle">골격근량 (kg)</label><input type="number" id="set-muscle" min="5" max="90" step="0.1" inputmode="decimal" placeholder="예: 22.4"></div>
+          </div>
+          <input type="text" id="set-condition" maxlength="200" placeholder="운동할 때 주의할 점 (선택, 예: 무릎 통증, 허리 디스크)" style="margin-top:6px;min-height:38px;padding:8px 11px;border:1px solid var(--line);border-radius:11px">
+        </div>
         <div class="field">
           <span class="label">사용 가능한 장비</span>
           <div class="chip-group" id="set-equipment"></div>

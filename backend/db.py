@@ -99,6 +99,14 @@ CREATE TABLE IF NOT EXISTS day_meta (
     coach_created_at TEXT,
     PRIMARY KEY (user_id, date)
 );
+
+-- The latest AI workout routine per user. input_hash detects when body values or settings changed.
+CREATE TABLE IF NOT EXISTS workout_plans (
+    user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    plan TEXT NOT NULL,
+    input_hash TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
 """
 
 
