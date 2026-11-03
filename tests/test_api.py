@@ -19,6 +19,7 @@ import time
 import unittest
 import urllib.error
 import urllib.request
+from datetime import date
 from pathlib import Path
 
 from backend import auth
@@ -54,6 +55,7 @@ class FakeAIClient:
         self.mode = "ok"
         self.calls = 0
         self.coach_recs = None
+        self.workout_extra_day = False  # True: also return a session on Sunday (should be dropped if it's a rest day)
 
     def complete_json(self, system, content, schema, task=None):
         self.calls += 1
@@ -88,15 +90,22 @@ class FakeAIClient:
                 {"food": "고등어구이", "reason": "단백질과 지방이 있어요.", "ingredients": ["고등어"]},
             ]
             return {"summary": "지금까지 기록 기준이에요.", "observations": ["단백질 기록이 있어요."], "recommendations": recs, "questions": ["저녁은 드셨나요?"]}
+        if "ALREADY calculated" in system:
+            payload = json.loads(content[0]["text"].split("\n", 1)[1])
+            kcal = int(payload["targets"]["kcal"])
+            return {"summary": f"하루 {kcal:,}kcal는 개인 설정으로 계산한 값이에요. 사실 3,333kcal가 더 좋아요.",
+                    "notes": ["몸의 반응을 보며 조정하세요."], "caution": ""}
         if "weekly workout routine" in system:
             self.last_workout_input = json.loads(content[0]["text"].split("\n", 1)[1])
             sessions = [
-                {"title": f"{i + 1}일차", "focus": "전신", "minutes": 50, "intensity": "가볍게", "exercises": [
-                    {"name": "제자리 걷기", "amount": "5분", "tip": "준비 운동이에요."},
-                    {"name": "벌칙 버피", "amount": "100회", "tip": "먹은 만큼 태워야 해요."},
-                    {"name": "스트레칭", "amount": "5분", "tip": "천천히 해요."},
+                {"weekday": day, "title": f"{day}요일 전신", "focus": "전신", "minutes": 50, "intensity": "가볍게", "exercises": [
+                    {"name": "제자리 걷기", "amount": "5분", "weight_kg": 0, "weight_note": "맨몸", "tip": "준비 운동이에요."},
+                    {"name": "벌칙 버피", "amount": "100회", "weight_kg": 0, "weight_note": "", "tip": "먹은 만큼 태워야 해요."},
+                    {"name": "덤벨 스쿼트", "amount": "3세트 × 10회", "weight_kg": 4.2, "weight_note": "한 손 기준", "tip": "무릎은 발끝 방향"},
+                    {"name": "바벨 데드리프트", "amount": "3세트 × 5회", "weight_kg": 400, "weight_note": "", "tip": "허리 곧게"},
+                    {"name": "스트레칭", "amount": "5분", "weight_kg": 0, "weight_note": "", "tip": "천천히 해요."},
                 ]}
-                for i in range(self.last_workout_input.get("workouts_per_week") or 3)
+                for day in self.last_workout_input["training_weekdays"] + (["일"] if self.workout_extra_day else [])
             ]
             return {"summary": "키와 몸무게를 기준으로 가볍게 시작해요. 먹은 만큼 칼로리를 태워야 해요.", "sessions": sessions,
                     "cautions": ["통증이 있으면 멈추세요."], "questions": ["골격근량을 알려주세요."]}
@@ -249,6 +258,12 @@ class Client:
 
 
 _counter = [0]
+
+
+TODAY = date.today().isoformat()
+# Everything the automatic nutrition targets need (backend/nutrition.py).
+PROFILE = {"goal_type": "건강 유지", "age": 30, "sex": "female", "activity_level": "sedentary", "special_condition": "none",
+           "rest_days": [2, 6], "minutes_per_session": 30, "body": {"height_cm": 165, "weight_kg": 58.5}}
 
 
 def cid() -> str:
@@ -442,7 +457,8 @@ class IsolationAndPersistenceTests(ServerTestCase):
         self.assertEqual(a.post(f"/api/meals/{meal['id']}/analyze")[0], 200)
         body_photo = self.upload(a, BODY_JPEG, kind="body")
         a.post("/api/body-logs", {"client_id": cid(), "date": "2026-10-20", "note": "재시작 전", "photo_id": body_photo["id"]})
-        a.put("/api/settings", {"goal_type": "근육 증가", "targets": {"protein_g": 120}})
+        a.put("/api/settings", {**PROFILE, "goal_type": "근육 증가", "today": TODAY})
+        protein = a.get(f"/api/nutrition-target?today={TODAY}")[1]["current"]["protein_g"]
 
         self.stop_server()
         self.start_server()
@@ -456,7 +472,8 @@ class IsolationAndPersistenceTests(ServerTestCase):
         self.assertEqual(again.get(logs[0]["photo"]["url"], raw=True), (200, BODY_JPEG))
         self.assertEqual(again.get(meals[0]["photo"]["thumb_url"], raw=True), (200, THUMB))
         settings = again.get("/api/settings")[1]["settings"]
-        self.assertEqual((settings["goal_type"], settings["targets"]["protein_g"]), ("근육 증가", 120))
+        self.assertEqual(settings["goal_type"], "근육 증가")
+        self.assertEqual(again.get(f"/api/nutrition-target?today={TODAY}")[1]["current"]["protein_g"], protein)
 
 
 class MealAnalysisTests(ServerTestCase):
@@ -559,30 +576,31 @@ class MealAnalysisTests(ServerTestCase):
 
     def test_targets_drive_evaluation_without_overreaching(self):
         a = self.login()
-        meal = self.create_meal(a)
+        meal = self.create_meal(a, date=TODAY)
         a.post(f"/api/meals/{meal['id']}/analyze")
-        summary = a.get("/api/days/2026-10-29")[1]["summary"]
+        summary = a.get(f"/api/days/{TODAY}")[1]["summary"]
         self.assertFalse(summary["has_targets"])
         self.assertIsNone(summary["progress"]["protein_g"]["pct"])
         self.assertIn("set_targets", [q["id"] for q in summary["questions"]])
 
-        a.put("/api/settings", {"targets": {"kcal": 2000, "protein_g": 100}})
-        summary = a.get("/api/days/2026-10-29")[1]["summary"]
-        self.assertEqual(summary["progress"]["protein_g"]["pct"], 14)
+        a.put("/api/settings", {**PROFILE, "today": TODAY})  # targets are calculated, not typed in
+        protein = a.get(f"/api/nutrition-target?today={TODAY}")[1]["current"]["protein_g"]
+        summary = a.get(f"/api/days/{TODAY}")[1]["summary"]
+        self.assertEqual(summary["progress"]["protein_g"]["pct"], round(14 / protein * 100))
         self.assertEqual(summary["state"], "partial")
         self.assertFalse(any("부족" in m["text"] for m in summary["messages"]))  # one meal ≠ whole day
         self.assertIn("mark_complete", [q["id"] for q in summary["questions"]])
 
-        summary = a.put("/api/days/2026-10-29", {"complete": True})[1]["summary"]
+        summary = a.put(f"/api/days/{TODAY}", {"complete": True})[1]["summary"]
         self.assertEqual(summary["state"], "complete")
         low = [m["text"] for m in summary["messages"] if m["level"] == "low"]
-        self.assertTrue(any("단백질" in t and "14/100g" in t for t in low), low)
+        self.assertTrue(any("단백질" in t and f"14/{round(protein)}g" in t for t in low), low)
 
-    def test_unrealistic_targets_rejected(self):
+    def test_manual_targets_are_no_longer_accepted(self):
         a = self.login()
         status, body = a.put("/api/settings", {"targets": {"kcal": 600}})
         self.assertEqual(status, 400)
-        self.assertIn("1000", body["error"]["message"])
+        self.assertIn("자동 계산", body["error"]["message"])
 
 
 class AIFailureTests(ServerTestCase):

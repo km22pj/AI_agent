@@ -20,6 +20,9 @@ from urllib.parse import parse_qs, urlsplit
 
 from . import auth
 from .ai import AIError, AINotConfigured, AIService, build_ai_service
+from . import progression
+from .nutrition import SOURCES as NUTRITION_SOURCES
+from .nutrition import compute_targets
 from .config import PROJECT_ROOT, Settings, parse_emails, read_env_value
 from .db import Database, dumps, loads, now_iso
 from .logic import (
@@ -28,6 +31,7 @@ from .logic import (
     ValidationError,
     ai_profile,
     body_metrics,
+    build_challenges,
     date_range,
     day_totals,
     default_settings,
@@ -36,6 +40,7 @@ from .logic import (
     normalize_settings,
     parse_client_id,
     parse_date,
+    training_schedule,
     workout_profile,
     parse_items,
     parse_manual_nutrition,
@@ -208,6 +213,7 @@ box-shadow:0 12px 32px rgb(34 40 56 / 5%);text-align:center">
 class App:
     def __init__(self, settings: Settings, ai: AIService | None = None, key_store: auth.GoogleKeyStore | None = None):
         self.settings = settings
+        self._started_code_stamp = self._code_stamp()  # to tell "unknown API" apart from "server not restarted"
         self.db = Database(settings.data_dir / "healthlingo.db")
         self.upload_dir = settings.data_dir / "uploads"
         self.upload_dir.mkdir(parents=True, exist_ok=True)
@@ -248,6 +254,9 @@ class App:
             R("GET", r"/api/overview", self.overview),
             R("GET", r"/api/workout-plan", self.get_workout_plan),
             R("POST", r"/api/workout-plan", self.create_workout_plan),
+            R("PUT", r"/api/exercise-checks", self.put_exercise_check),
+            R("GET", r"/api/nutrition-target", self.get_nutrition_target),
+            R("POST", r"/api/nutrition-target/explain", self.explain_nutrition_target),
         ]
         self.secret = self._load_secret()
         self._allow_lock = threading.Lock()
@@ -343,7 +352,22 @@ class App:
                 raise HTTPError(400, "invalid", str(exc)) from exc
         if allowed_methods:
             raise HTTPError(405, "method_not_allowed", "지원하지 않는 요청이에요.")
+        if self.code_changed_since_start():
+            # The page (read from disk on every request) is newer than the running server code.
+            log.warning("알 수 없는 API 요청(%s %s): 서버 코드가 바뀌었어요. 서버를 다시 시작하세요.", method, path)
+            raise HTTPError(404, "restart_needed", "서버가 아직 예전 버전으로 실행 중이라 이 기능을 쓸 수 없어요. 서버를 다시 시작해 주세요.")
         raise HTTPError(404, "not_found", "요청한 기능을 찾을 수 없어요.")
+
+    @staticmethod
+    def _code_stamp() -> float:
+        files = [*(PROJECT_ROOT / "backend").glob("*.py"), PROJECT_ROOT / "run.py"]
+        return max((f.stat().st_mtime for f in files if f.is_file()), default=0.0)
+
+    def code_changed_since_start(self) -> bool:
+        try:
+            return self._code_stamp() > self._started_code_stamp
+        except OSError:
+            return False
 
     def _check_csrf(self, req: Request) -> None:
         # Cross-site forms cannot set custom headers; same-origin fetch() always does.
@@ -480,16 +504,161 @@ class App:
 
     def put_settings(self, req: Request) -> Response:
         uid = req.user["id"]
+        raw = dict(req.json() or {})
+        today = self._client_today(raw.pop("today", None))
         with self.db.write_lock:
             current = self._load_settings(uid)
-            updated = normalize_settings(req.json(), current, now_iso())
+            updated = normalize_settings(raw, current, now_iso())
             with self.db.connect() as conn:
                 conn.execute(
                     "INSERT INTO user_settings (user_id, data, updated_at) VALUES (?, ?, ?) "
                     "ON CONFLICT(user_id) DO UPDATE SET data = excluded.data, updated_at = excluded.updated_at",
                     (uid, dumps(updated), now_iso()),
                 )
-        return Response(body={"settings": updated})
+            changed = self._refresh_targets(uid, updated, today)
+        return Response(body={"settings": updated, "nutrition": self._nutrition_payload(uid, today), "nutrition_changed": changed})
+
+    # ------------------------------------------------------------ nutrition targets
+
+    @staticmethod
+    def _client_today(value) -> str:
+        """The user's local date (sent by the browser), if it is plausible; else the server's date."""
+        server = datetime.now(timezone.utc).date()
+        try:
+            day = date.fromisoformat(parse_date(value))
+            if abs((day - server).days) <= 1:
+                return day.isoformat()
+        except (ValidationError, ValueError, TypeError):
+            pass
+        return server.isoformat()
+
+    def _target_rows(self, conn, uid: int):
+        return conn.execute("SELECT * FROM nutrition_targets WHERE user_id = ? ORDER BY effective_date, id", (uid,)).fetchall()
+
+    def _ensure_legacy_target(self, conn, uid: int, settings: dict) -> None:
+        """Targets typed in by hand before auto calculation keep applying to the days before the first auto target."""
+        if conn.execute("SELECT 1 FROM nutrition_targets WHERE user_id = ?", (uid,)).fetchone():
+            return
+        legacy = settings.get("targets") or {}
+        if any(legacy.get(k) is not None for k in ("kcal", "carbs_g", "protein_g", "fat_g")):
+            conn.execute(
+                "INSERT INTO nutrition_targets (user_id, effective_date, status, source, kcal, carbs_g, protein_g, fat_g, message, created_at) "
+                "VALUES (?, '0001-01-01', 'ok', 'legacy', ?, ?, ?, ?, ?, ?)",
+                (uid, legacy.get("kcal"), legacy.get("carbs_g"), legacy.get("protein_g"), legacy.get("fat_g"),
+                 "자동 계산 이전에 직접 입력한 목표", settings.get("targets_confirmed_at") or now_iso()),
+            )
+
+    def _refresh_targets(self, uid: int, settings: dict, today: str) -> bool:
+        """Recalculate when an input changed. A new row takes effect today; earlier days keep theirs.
+        Returns True when a new target row was stored. Caller holds the write lock."""
+        result = compute_targets(settings)
+        with self.db.write_lock, self.db.connect() as conn:
+            self._ensure_legacy_target(conn, uid, settings)
+            rows = self._target_rows(conn, uid)
+            latest = rows[-1] if rows else None
+            if latest is not None and latest["input_hash"] == result["input_hash"]:
+                return False
+            if result["status"] != "ok" and (latest is None or latest["status"] != "ok"):
+                return False  # nothing to replace; the setup notice is computed live
+            ok = result["status"] == "ok"
+            conn.execute(
+                "INSERT INTO nutrition_targets (user_id, effective_date, status, source, kcal, carbs_g, protein_g, fat_g, inputs, basis, input_hash, message, created_at) "
+                "VALUES (?, ?, ?, 'auto', ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (uid, today, result["status"],
+                 result.get("kcal") if ok else None, result.get("carbs_g") if ok else None,
+                 result.get("protein_g") if ok else None, result.get("fat_g") if ok else None,
+                 dumps(result["inputs"]), dumps(result.get("basis")), result["input_hash"], result.get("message", ""), now_iso()),
+            )
+        return True
+
+    @staticmethod
+    def _target_out(row) -> dict | None:
+        if row is None:
+            return None
+        return {
+            "id": row["id"], "effective_date": row["effective_date"], "status": row["status"], "source": row["source"],
+            "kcal": row["kcal"], "carbs_g": row["carbs_g"], "protein_g": row["protein_g"], "fat_g": row["fat_g"],
+            "basis": loads(row["basis"]), "message": row["message"], "created_at": row["created_at"],
+            "explanation": loads(row["explanation"]), "explanation_status": row["explanation_status"],
+        }
+
+    def _ensure_legacy(self, uid: int) -> None:
+        settings = self._load_settings(uid)
+        with self.db.write_lock, self.db.connect() as conn:
+            self._ensure_legacy_target(conn, uid, settings)
+
+    def _target_for(self, uid: int, day: str) -> dict | None:
+        """The target that applied on `day` (None if none, or if it was a 'missing/unsupported' period)."""
+        self._ensure_legacy(uid)
+        with self.db.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM nutrition_targets WHERE user_id = ? AND effective_date <= ? ORDER BY effective_date DESC, id DESC LIMIT 1",
+                (uid, day)).fetchone()
+        out = self._target_out(row)
+        return out if out and out["status"] == "ok" else None
+
+    @staticmethod
+    def _targets_dict(target: dict | None) -> dict:
+        keys = ("kcal", "carbs_g", "protein_g", "fat_g")
+        return {k: (target[k] if target else None) for k in keys}
+
+    def _nutrition_payload(self, uid: int, today: str) -> dict:
+        self._ensure_legacy(uid)
+        settings = self._load_settings(uid)
+        live = compute_targets(settings)  # deterministic, no AI: tells what is missing right now
+        with self.db.connect() as conn:
+            rows = self._target_rows(conn, uid)
+        history = [self._target_out(r) for r in rows if r["effective_date"] <= today]
+        current = history[-1] if history else None
+        return {
+            "current": current if current and current["status"] == "ok" else None,
+            "current_row": current,
+            "setup": {"status": live["status"], "missing": live.get("missing", []), "message": live.get("message", "")},
+            "history": list(reversed(history))[:10],
+            "sources": NUTRITION_SOURCES,
+        }
+
+    def _today_nutrition(self, uid: int, today: str) -> dict:
+        """For the Today tab: the same stored target and the same progress numbers as the food screen."""
+        payload = self._nutrition_payload(uid, today)
+        summary = self._day_payload(uid, today)["summary"]
+        return {"current": payload["current"], "setup": payload["setup"], "progress": summary["progress"],
+                "meal_count": summary["meal_count"], "uncounted": summary["uncounted"]}
+
+    def get_nutrition_target(self, req: Request) -> Response:
+        return Response(body=self._nutrition_payload(req.user["id"], self._client_today(req.query.get("today"))))
+
+    def explain_nutrition_target(self, req: Request) -> Response:
+        """AI writes a short explanation of the stored numbers. The numbers themselves never come from AI."""
+        uid = req.user["id"]
+        today = self._client_today((req.json() or {}).get("today"))
+        payload = self._nutrition_payload(uid, today)
+        target = payload["current"]
+        if not target or target["source"] != "auto":
+            raise ValidationError("설명할 자동 계산 목표가 없어요. 개인 설정을 먼저 입력해 주세요.")
+        settings = self._load_settings(uid)
+        key = f"explain:{uid}"
+        self._claim(key)
+        try:
+            try:
+                explanation = self.ai.explain_targets({
+                    "targets": self._targets_dict(target),
+                    "calculation": target["basis"],
+                    "goal": settings.get("goal_type") or None,
+                    "goal_note": settings.get("goal_note") or None,
+                    "cautions_from_user": (settings.get("body") or {}).get("condition_note") or None,
+                })
+                status = "ok"
+            except AIError as exc:
+                with self.db.write_lock, self.db.connect() as conn:
+                    conn.execute("UPDATE nutrition_targets SET explanation_status = 'failed' WHERE id = ? AND user_id = ?", (target["id"], uid))
+                raise ai_http_error(exc) from exc
+        finally:
+            self._release(key)
+        with self.db.write_lock, self.db.connect() as conn:
+            conn.execute("UPDATE nutrition_targets SET explanation = ?, explanation_status = ? WHERE id = ? AND user_id = ?",
+                         (dumps(explanation), status, target["id"], uid))
+        return Response(body=self._nutrition_payload(uid, today))
 
     # ------------------------------------------------------------ photos
 
@@ -803,7 +972,7 @@ class App:
                 "other_meals_totals": {k: v["value"] for k, v in agg["totals"].items()},
                 "unanalyzed_other_meals": agg["uncounted"],
             }
-            settings = self._load_settings(uid)
+            settings, _ = self._settings_for_day(uid, row["date"])
             try:
                 result = self.ai.estimate(meal, ai_profile(settings), day_context)
             except AIError as exc:
@@ -859,9 +1028,15 @@ class App:
         }
         return hashlib.sha256(dumps(material).encode("utf-8")).hexdigest()
 
+    def _settings_for_day(self, uid: int, day: str) -> tuple[dict, dict | None]:
+        """Settings with `targets` replaced by the stored target that applied on that day."""
+        settings = self._load_settings(uid)
+        target = self._target_for(uid, day)
+        return {**settings, "targets": self._targets_dict(target)}, target
+
     def _day_payload(self, uid: int, day: str) -> dict:
         meals = self._meals_for(uid, day, day)
-        settings = self._load_settings(uid)
+        settings, target = self._settings_for_day(uid, day)
         with self.db.connect() as conn:
             meta = conn.execute("SELECT * FROM day_meta WHERE user_id = ? AND date = ?", (uid, day)).fetchone()
         complete = bool(meta and meta["complete"])
@@ -876,6 +1051,7 @@ class App:
             "summary": evaluate_day(meals, settings, complete),
             "complete": complete,
             "coach": coach,
+            "target": {k: target[k] for k in ("source", "effective_date", "created_at")} if target else None,
         }
 
     def get_day(self, req: Request) -> Response:
@@ -900,7 +1076,7 @@ class App:
         payload = self._day_payload(uid, day)
         if not payload["meals"]:
             raise ValidationError("이 날짜에는 식사 기록이 없어 피드백을 만들 수 없어요. 먼저 식사를 기록해 주세요.")
-        settings = self._load_settings(uid)
+        settings, _ = self._settings_for_day(uid, day)
         summary = payload["summary"]
         ai_input = {
             "date": day,
@@ -948,7 +1124,6 @@ class App:
         by_day: dict[str, list] = {d: [] for d in days}
         for meal in meals:
             by_day.setdefault(meal["date"], []).append(meal)
-        settings = self._load_settings(uid)
         series = []
         for d in days:
             agg = day_totals(by_day[d])
@@ -957,8 +1132,10 @@ class App:
                 "meal_count": agg["meal_count"],
                 "uncounted": agg["uncounted"],
                 "totals": {k: v["value"] for k, v in agg["totals"].items()},
+                "targets": self._targets_dict(self._target_for(uid, d)),  # each day keeps the target it had
             })
-        return Response(body={"from": start, "to": end, "days": series, "targets": settings["targets"]})
+        latest = series[-1]["targets"] if series else self._targets_dict(None)
+        return Response(body={"from": start, "to": end, "days": series, "targets": latest})
 
     # ------------------------------------------------------------ body logs
 
@@ -1086,7 +1263,37 @@ class App:
     def _workout_hash(self, profile: dict) -> str:
         return hashlib.sha256(dumps(profile).encode("utf-8")).hexdigest()
 
-    def _workout_payload(self, uid: int) -> dict:
+    def _last_week_review(self, uid: int, plan: dict, created_at: str, today: date) -> dict | None:
+        monday = progression.week_start(today) - timedelta(days=7)
+        with self.db.connect() as conn:
+            rows = conn.execute("SELECT date, item FROM exercise_checks WHERE user_id = ? AND date BETWEEN ? AND ?",
+                                (uid, monday.isoformat(), (monday + timedelta(days=6)).isoformat())).fetchall()
+        return progression.review_week(plan, date.fromisoformat(created_at[:10]), {(r["date"], r["item"]) for r in rows}, monday)
+
+    def _maybe_adjust_workout(self, uid: int, today: date) -> None:
+        """Once per week: look at last week's completion and make the saved routine easier or harder."""
+        this_monday = progression.week_start(today).isoformat()
+        with self.db.write_lock:
+            with self.db.connect() as conn:
+                row = conn.execute("SELECT plan, created_at FROM workout_plans WHERE user_id = ?", (uid,)).fetchone()
+            if row is None:
+                return
+            plan = loads(row["plan"])
+            if plan.get("format", 1) < 3 or plan.get("adjusted_week") == this_monday:
+                return
+            review = self._last_week_review(uid, plan, row["created_at"], today)
+            new = plan
+            if review:
+                new, changes = progression.adjust_plan(plan, review["level"])
+                entry = {**review, "applied_week": this_monday, "changes": changes, "source": "auto"}
+                new["adjustments"] = [entry] + plan.get("adjustments", [])[:7]
+            new["adjusted_week"] = this_monday
+            with self.db.connect() as conn:
+                conn.execute("UPDATE workout_plans SET plan = ? WHERE user_id = ?", (dumps(new), uid))
+
+    def _workout_payload(self, uid: int, today: date | None = None) -> dict:
+        if today is not None:
+            self._maybe_adjust_workout(uid, today)
         settings = self._load_settings(uid)
         profile = workout_profile(settings)
         with self.db.connect() as conn:
@@ -1094,10 +1301,36 @@ class App:
         plan = None
         if row:
             plan = {**loads(row["plan"]), "created_at": row["created_at"], "stale": row["input_hash"] != self._workout_hash(profile)}
-        return {"body": body_metrics(settings), "plan": plan}
+        return {"body": body_metrics(settings), "plan": plan, "schedule": training_schedule(settings)}
+
+    def _today_workout(self, uid: int, today: date) -> dict:
+        """Today's part of the weekly routine, for the Today tab."""
+        payload = self._workout_payload(uid, today)
+        plan, schedule = payload["plan"], payload["schedule"]
+        weekday = today.weekday()
+        out = {"weekday": weekday, "status": "no_plan", "session": None, "stale": bool(plan and plan["stale"]), "rest_source": schedule["source"]}
+        # A rest day chosen by the user always wins, even over an older routine.
+        if schedule["source"] == "rest_days" and weekday in schedule["rest_days"]:
+            return {**out, "status": "rest"}
+        if plan is None:
+            return out
+        if plan.get("format", 1) < 3:
+            return {**out, "status": "outdated"}
+        session = next((s for s in plan["sessions"] if s.get("weekday") == weekday), None)
+        if session:
+            exercises = [{**ex, "key": f"{i}:{ex['name']}"[:100]} for i, ex in enumerate(session["exercises"])]
+            keys = {ex["key"] for ex in exercises}
+            with self.db.connect() as conn:
+                rows = conn.execute("SELECT item FROM exercise_checks WHERE user_id = ? AND date = ?", (uid, today.isoformat())).fetchall()
+            checked = [r["item"] for r in rows if r["item"] in keys]
+            return {**out, "status": "workout", "session": {**session, "exercises": exercises}, "checked": checked}
+        if weekday in schedule["rest_days"]:
+            return {**out, "status": "rest"}
+        return {**out, "status": "unscheduled"}  # the routine was made before today became a workout day
 
     def get_workout_plan(self, req: Request) -> Response:
-        return Response(body=self._workout_payload(req.user["id"]))
+        today = date.fromisoformat(self._client_today(req.query.get("today")))
+        return Response(body=self._workout_payload(req.user["id"], today))
 
     def create_workout_plan(self, req: Request) -> Response:
         uid = req.user["id"]
@@ -1106,16 +1339,34 @@ class App:
         if metrics["height_cm"] is None or metrics["weight_kg"] is None:
             raise ValidationError("운동 루틴을 추천하려면 개인 설정에서 키와 몸무게를 먼저 입력해 주세요.")
         profile = workout_profile(settings)
+        today = date.fromisoformat(self._client_today((req.json() or {}).get("today")))
+        with self.db.connect() as conn:
+            prev_row = conn.execute("SELECT plan, created_at FROM workout_plans WHERE user_id = ?", (uid,)).fetchone()
+        previous = loads(prev_row["plan"]) if prev_row else None
+        review = self._last_week_review(uid, previous, prev_row["created_at"], today) if previous and previous.get("format", 1) >= 3 else None
+        ai_input = dict(profile)  # the hash below uses `profile` only, so a review never marks the routine stale
+        if review:
+            ai_input["progress_review"] = {"last_week_completion_rate": review["rate"], "done": review["done"], "planned": review["planned"], "adjustment": review["level"]}
+            ai_input["previous_plan"] = [
+                {"weekday": s.get("weekday"), "title": s["title"], "intensity": s["intensity"],
+                 "exercises": [{"name": e["name"], "amount": e["amount"], "weight_kg": e.get("weight_kg")} for e in s["exercises"]]}
+                for s in previous["sessions"]]
         key = f"workout:{uid}"
         self._claim(key)
         try:
             try:
-                plan = self.ai.workout(profile)
+                plan = self.ai.workout(ai_input)
             except AIError as exc:
                 raise ai_http_error(exc) from exc
         finally:
             self._release(key)
         plan["model"] = plan.get("model") or self.settings.ai_model
+        if review:
+            capped = progression.cap_against_previous(plan, previous, review["level"])
+            plan["adjustments"] = [{**review, "applied_week": progression.week_start(today).isoformat(), "source": "ai",
+                                    "changes": ["지난주 달성도를 반영해 새 루틴을 만들었어요"] + ([f"안전을 위해 중량·강도 {capped}곳을 이전 루틴 기준으로 맞췄어요"] if capped else [])}]
+        plan["adjustments"] = plan.get("adjustments", []) + (previous or {}).get("adjustments", [])[:7]
+        plan["adjusted_week"] = progression.week_start(today).isoformat()  # this week is already reflected
         with self.db.write_lock, self.db.connect() as conn:
             conn.execute(
                 "INSERT INTO workout_plans (user_id, plan, input_hash, created_at) VALUES (?, ?, ?, ?) "
@@ -1123,6 +1374,32 @@ class App:
                 (uid, dumps(plan), self._workout_hash(profile), now_iso()),
             )
         return Response(body=self._workout_payload(uid))
+
+    def put_exercise_check(self, req: Request) -> Response:
+        """Mark one exercise of the day's routine done / not done. A day with at least one
+        done exercise counts as a movement day (streak, challenges, monthly stats)."""
+        uid = req.user["id"]
+        body = req.json()
+        day = parse_date(body.get("date"))
+        item, done = body.get("item"), body.get("done")
+        if not isinstance(item, str) or not isinstance(done, bool):
+            raise ValidationError("운동 완료 정보가 올바르지 않아요.")
+        tw = self._today_workout(uid, date.fromisoformat(day))
+        if tw["status"] != "workout" or item not in {ex["key"] for ex in tw["session"]["exercises"]}:
+            raise ValidationError("오늘 루틴에 없는 운동이에요. 화면을 새로고침해 주세요.")
+        now = now_iso()
+        with self.db.write_lock, self.db.connect() as conn:
+            if done:
+                conn.execute("INSERT OR IGNORE INTO exercise_checks (user_id, date, item, created_at) VALUES (?, ?, ?, ?)", (uid, day, item, now))
+            else:
+                conn.execute("DELETE FROM exercise_checks WHERE user_id = ? AND date = ? AND item = ?", (uid, day, item))
+            count = conn.execute("SELECT COUNT(*) FROM exercise_checks WHERE user_id = ? AND date = ?", (uid, day)).fetchone()[0]
+            if count:
+                conn.execute("INSERT OR IGNORE INTO activities (user_id, date, kind, created_at) VALUES (?, ?, 'movement', ?)", (uid, day, now))
+            else:
+                conn.execute("DELETE FROM activities WHERE user_id = ? AND date = ? AND kind = 'movement'", (uid, day))
+        tw = self._today_workout(uid, date.fromisoformat(day))
+        return Response(body={"checked": tw.get("checked", [])})
 
     # ------------------------------------------------------------ overview
 
@@ -1158,6 +1435,7 @@ class App:
             meal_dates = [r["date"] for r in conn.execute("SELECT date FROM meals WHERE user_id = ?", (uid,))]
             body_dates = [r["date"] for r in conn.execute("SELECT date FROM body_logs WHERE user_id = ?", (uid,))]
             acts = conn.execute("SELECT date, kind FROM activities WHERE user_id = ?", (uid,)).fetchall()
+            has_plan = conn.execute("SELECT 1 FROM workout_plans WHERE user_id = ?", (uid,)).fetchone() is not None
         act_dates = [a["date"] for a in acts]
         recorded = sorted(set(meal_dates) | set(body_dates) | set(act_dates))
         recorded_set = set(recorded)
@@ -1172,6 +1450,17 @@ class App:
         for d in recorded:
             weeks[date.fromisoformat(d).isocalendar()[:2]] = weeks.get(date.fromisoformat(d).isocalendar()[:2], 0) + 1
         routine = any(count >= 3 for count in weeks.values())
+        streak = self._streaks(recorded, today)
+        week_set = set(week)
+        challenges = build_challenges(self._load_settings(uid), {
+            "total_record_days": sum(1 for d in recorded if d <= today_s),
+            "best_streak": streak["best"],
+            "movement_week": sum(1 for a in acts if a["kind"] == "movement" and a["date"] in week_set),
+            "meals_week": sum(1 for d in meal_dates if d in week_set),
+            "body_month": sum(1 for d in body_dates if in_month(d)),
+            "days_month": sum(1 for d in recorded if in_month(d)),
+            "has_plan": has_plan,
+        })
 
         return Response(body={
             "today": today_s,
@@ -1186,7 +1475,10 @@ class App:
                 for d in week
             ],
             "week_record_days": sum(1 for d in week if d in recorded_set),
-            "streak": self._streaks(recorded, today),
+            "streak": streak,
+            "challenges": challenges,
+            "today_workout": self._today_workout(uid, today),
+            "nutrition": self._today_nutrition(uid, today_s),
             "missions": {
                 "warmup": any(a["date"] == today_s and a["kind"] == "warmup" for a in acts),
                 "movement": any(a["date"] == today_s and a["kind"] == "movement" for a in acts),

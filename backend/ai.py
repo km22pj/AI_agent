@@ -132,6 +132,7 @@ WORKOUT_SCHEMA = {
             "items": {
                 "type": "object",
                 "properties": {
+                    "weekday": {"type": "string", "enum": ["월", "화", "수", "목", "금", "토", "일"]},
                     "title": {"type": "string"},
                     "focus": {"type": "string"},
                     "minutes": {"type": "integer"},
@@ -143,14 +144,16 @@ WORKOUT_SCHEMA = {
                             "properties": {
                                 "name": {"type": "string"},
                                 "amount": {"type": "string"},
+                                "weight_kg": {"type": "number"},
+                                "weight_note": {"type": "string"},
                                 "tip": {"type": "string"},
                             },
-                            "required": ["name", "amount", "tip"],
+                            "required": ["name", "amount", "weight_kg", "weight_note", "tip"],
                             "additionalProperties": False,
                         },
                     },
                 },
-                "required": ["title", "focus", "minutes", "intensity", "exercises"],
+                "required": ["weekday", "title", "focus", "minutes", "intensity", "exercises"],
                 "additionalProperties": False,
             },
         },
@@ -202,13 +205,40 @@ Write every human-readable string in Korean.
 You receive the user's current body values (height, weight, skeletal muscle mass if known, and BMI / skeletal-muscle ratio that the app calculated), goal, exercise experience, available equipment, how many times a week and how many minutes per session they can work out, and any cautions they wrote (pain, injuries).
 
 - summary: 2-3 sentences explaining why this routine fits, tied to the provided numbers and goal. Do not diagnose, and do not label the body as good/bad or comment on appearance. BMI does not reflect muscle mass; say so if you use it.
-- sessions: one entry per workout day, titled "1일차", "2일차", ... Use workouts_per_week if given (otherwise 3). Each session's minutes must not exceed minutes_per_session if given (otherwise 30). Each session starts with a warm-up and ends with a cool-down/stretch inside its exercises.
+- sessions: a Monday-to-Sunday week. Give exactly one session for each day in training_weekdays (weekday = that day, e.g. "월") and none for rest_weekdays. title: a short focus title such as "하체·코어".
+- Balance the week: rotate muscle groups so the same main muscle group is not trained hard on two consecutive training days, mix strength, cardio and mobility, and put harder sessions after rest days.
+- Each session's minutes must not exceed minutes_per_session if given (otherwise 30). Each session starts with a warm-up and ends with a cool-down/stretch inside its exercises.
 - Only use the listed equipment (bodyweight is always allowed). Match difficulty to experience; for beginners or when experience is unknown, choose easy, low-impact movements.
 - If the user wrote cautions, avoid movements that load those areas and mention it.
 - amount: sets x reps, or minutes, e.g. "2세트 × 10회", "5분". tip: one short form or safety tip.
+- weight_kg: a concrete starting weight in kg for every exercise that uses an external load (dumbbell, kettlebell, barbell, machine). Base it on body weight, skeletal muscle mass, experience and goal; start conservatively, choosing a weight the user can finish with 2-3 reps left. Use 0 for bodyweight moves, stretching, walking/cardio and bands. Only use loads with equipment the user has.
+- weight_note: what the weight means or how to adjust it, e.g. "한 손 기준", "양손 합계", "맨몸", "밴드 약한 강도", "마지막 2회가 힘들면 적당해요".
+- If progress_review and previous_plan are given, adapt the previous routine to how much of it was completed last week: adjustment "decrease" (less than half done) -> make it easier (one intensity level lower, fewer sets/reps, lighter loads); "increase" (everything done) -> make it a little harder (loads at most 2-10 % heavier, or 1-2 more reps, intensity at most one level higher); "keep" -> keep a similar difficulty. Mention the change in summary.
 - cautions: 2-4 short safety notes (e.g. stop if there is pain, consult a professional for medical conditions).
-- questions: ask for missing information that would improve the routine (up to 3), e.g. skeletal muscle mass if it is missing.
+- questions: always an empty list (the app does not show follow-up questions for routines).
 - Never suggest punishment or compensation exercise (e.g. to burn off food), exercising through pain, extreme volume, or skipping meals."""
+
+TARGET_EXPLAIN_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "summary": {"type": "string"},
+        "notes": {"type": "array", "items": {"type": "string"}},
+        "caution": {"type": "string"},
+    },
+    "required": ["summary", "notes", "caution"],
+    "additionalProperties": False,
+}
+
+TARGET_EXPLAIN_SYSTEM = """You explain daily nutrition targets that a Korean health app has ALREADY calculated with fixed formulas.
+Write every human-readable string in Korean, in a gentle tone.
+
+You receive the targets (kcal, carbohydrate, protein, fat in grams), the calculation steps (resting energy by the Mifflin-St Jeor equation, physical activity level for daily life, planned exercise energy, goal adjustment, protein per kg, macro shares), and the user's goal and free-text notes.
+
+- Never change, recalculate or invent numbers. Only use numbers that appear in the input.
+- summary: 2-3 sentences on how the targets follow from the user's settings.
+- notes: up to 3 short practical notes on using the targets (they are estimates; adjust with how the body responds).
+- caution: if the user's free-text notes or goal note mention pregnancy, breastfeeding, a disease, medication, an eating disorder or a doctor's diet instructions, say in one sentence that the general targets may not fit and a professional should be consulted. Otherwise an empty string.
+- Never recommend fasting, skipping meals, or very low calorie intake."""
 
 # ---------------------------------------------------------------- safety helpers
 
@@ -383,7 +413,78 @@ def validate_coach(data, blocked_terms: list[str]) -> dict:
     }
 
 
-def validate_workout(data, max_minutes: int | None = None) -> dict:
+NUMBER_RE = re.compile(r"\d[\d,]*(?:\.\d+)?")
+
+
+def _canon(number) -> str:
+    """1850.0 / "1,850" / "1850" -> "1850";  1.40 -> "1.4"."""
+    return "%g" % float(str(number).replace(",", ""))
+
+
+def _numbers_in(value) -> set[str]:
+    """All numbers in a nested structure, normalized with _canon (plus their rounded values)."""
+    out: set[str] = set()
+    if isinstance(value, dict):
+        for v in value.values():
+            out |= _numbers_in(v)
+    elif isinstance(value, (list, tuple)):
+        for v in value:
+            out |= _numbers_in(v)
+    elif isinstance(value, bool):
+        pass
+    elif isinstance(value, (int, float)):
+        out |= {_canon(value), _canon(round(value))}
+    elif isinstance(value, str):
+        out |= {_canon(m) for m in NUMBER_RE.findall(value)}
+    return out
+
+
+def _drop_invented_numbers(text: str, allowed: set[str]) -> tuple[str, bool]:
+    """Remove sentences that contain a number not present in the calculation input."""
+    parts = re.split(r"(?<=[.!?。])\s+|\n+", text or "")
+    kept = [p for p in parts if not ({_canon(m) for m in NUMBER_RE.findall(p)} - allowed)]
+    return " ".join(p.strip() for p in kept if p.strip()), len(kept) != len(parts)
+
+
+def validate_target_explanation(data, payload: dict) -> dict:
+    if not isinstance(data, dict):
+        raise _invalid("explanation not object")
+    allowed = _numbers_in(payload) | {"1", "2", "3"}
+    dropped = False
+    summary, d = _drop_invented_numbers(strip_unsafe_sentences(_clean_str(data.get("summary"), 500, "summary"))[0], allowed)
+    dropped |= d
+    notes = []
+    for text in _clean_str_list(data.get("notes"), 3, 200, "notes"):
+        cleaned, d = _drop_invented_numbers(strip_unsafe_sentences(text)[0], allowed)
+        dropped |= d
+        if cleaned:
+            notes.append(cleaned)
+    caution, d = _drop_invented_numbers(_clean_str(data.get("caution"), 200, "caution"), allowed)
+    dropped |= d
+    return {"summary": summary, "notes": notes, "caution": caution, "dropped_sentences": dropped}
+
+
+MAX_LOAD_KG = 150
+
+
+def _load_kg(value, body_weight: float | None) -> tuple[float | None, bool]:
+    """(weight or None for no external load, True if an unsafe/invalid weight was dropped)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        return None, value is not None
+    if value <= 0:
+        return None, value < 0
+    limit = min(MAX_LOAD_KG, body_weight * 1.5) if body_weight else MAX_LOAD_KG
+    if value > limit:
+        return None, True
+    return round(float(value) * 2) / 2, False  # nearest 0.5kg, like real plates and dumbbells
+
+
+WEEKDAY_NAMES = ["월", "화", "수", "목", "금", "토", "일"]
+
+
+def validate_workout(data, max_minutes: int | None = None, body_weight: float | None = None,
+                     training_days: list[int] | None = None) -> dict:
+    """training_days (Mon=0): when given, the plan must have exactly one session on each of them."""
     if not isinstance(data, dict):
         raise _invalid("workout not object")
     raw_sessions = data.get("sessions")
@@ -391,6 +492,7 @@ def validate_workout(data, max_minutes: int | None = None) -> dict:
         raise _invalid("sessions missing")
     sessions = []
     removed = 0
+    loads_dropped = 0
     for raw in raw_sessions[:7]:
         if not isinstance(raw, dict):
             raise _invalid("session not object")
@@ -407,9 +509,14 @@ def validate_workout(data, max_minutes: int | None = None) -> dict:
         for ex in exercises_raw[:10]:
             if not isinstance(ex, dict):
                 raise _invalid("exercise not object")
+            weight, dropped = _load_kg(ex.get("weight_kg"), body_weight)
+            loads_dropped += dropped
+            note = ex.get("weight_note")
             item = {
                 "name": _clean_str(ex.get("name"), 60, "name", allow_empty=False),
                 "amount": _clean_str(ex.get("amount"), 40, "amount"),
+                "weight_kg": weight,
+                "weight_note": _clean_str(note, 60, "weight_note") if isinstance(note, str) else "",
                 "tip": _clean_str(ex.get("tip"), 160, "tip"),
             }
             if any(pat in item["name"] or pat in item["tip"] for pat in UNSAFE_PATTERNS):
@@ -418,7 +525,14 @@ def validate_workout(data, max_minutes: int | None = None) -> dict:
             exercises.append(item)
         if not exercises:
             continue
+        weekday = WEEKDAY_NAMES.index(raw["weekday"]) if raw.get("weekday") in WEEKDAY_NAMES else None
+        if training_days is not None:
+            if weekday is None:
+                raise _invalid("weekday missing")
+            if weekday not in training_days or any(s["weekday"] == weekday for s in sessions):
+                continue  # a rest day or a second session on the same day
         sessions.append({
+            "weekday": weekday,
             "title": _clean_str(raw.get("title"), 40, "title", allow_empty=False),
             "focus": _clean_str(raw.get("focus"), 60, "focus"),
             "minutes": minutes,
@@ -427,6 +541,10 @@ def validate_workout(data, max_minutes: int | None = None) -> dict:
         })
     if not sessions:
         raise _invalid("no usable sessions")
+    if training_days is not None:
+        if sorted(s["weekday"] for s in sessions) != sorted(training_days):
+            raise _invalid("sessions do not cover the training days")
+        sessions.sort(key=lambda s: s["weekday"])
     summary, _ = strip_unsafe_sentences(_clean_str(data.get("summary"), 500, "summary"))
     cautions = []
     for text in _clean_str_list(data.get("cautions"), 5, 200, "cautions"):
@@ -438,7 +556,9 @@ def validate_workout(data, max_minutes: int | None = None) -> dict:
         "sessions": sessions,
         "cautions": cautions,
         "filtered_exercises": removed,
+        "dropped_weights": loads_dropped,
         "questions": _clean_str_list(data.get("questions"), 3, 160, "questions"),
+        "format": 3,  # 2 = exercises carry weight_kg / weight_note, 3 = sessions are placed on weekdays
     }
 
 
@@ -517,7 +637,7 @@ class GeminiJSONClient:
     """
 
     # Recognizing foods in a photo needs little reasoning; estimates and coaching a bit more.
-    THINKING = {"recognize": "minimal", "estimate": "low", "coach": "low", "workout": "low"}
+    THINKING = {"recognize": "minimal", "estimate": "low", "coach": "low", "workout": "low", "explain": "minimal"}
     FALLBACK_CODES = {"ai_unavailable", "ai_timeout", "ai_rate_limited", "ai_model", "ai_truncated"}
     COOLDOWN_SECONDS = 300
 
@@ -697,10 +817,18 @@ class AIService:
         data, model = self._ask(COACH_SYSTEM, content, COACH_SCHEMA, "coach")
         return {**validate_coach(data, blocked_terms), "model": model}
 
+    def explain_targets(self, payload: dict) -> dict:
+        content = [{"type": "text", "text": "다음 계산 결과를 사용자에게 설명해 주세요.\n" + json.dumps(payload, ensure_ascii=False)}]
+        data, model = self._ask(TARGET_EXPLAIN_SYSTEM, content, TARGET_EXPLAIN_SCHEMA, "explain")
+        return {**validate_target_explanation(data, payload), "model": model}
+
     def workout(self, profile: dict) -> dict:
         content = [{"type": "text", "text": "다음 정보를 바탕으로 이번 주 운동 루틴을 추천해 주세요.\n" + json.dumps(profile, ensure_ascii=False)}]
         data, model = self._ask(WORKOUT_SYSTEM, content, WORKOUT_SCHEMA, "workout")
-        return {**validate_workout(data, profile.get("minutes_per_session")), "model": model}
+        body_weight = (profile.get("body") or {}).get("weight_kg")
+        days = profile.get("training_weekdays")
+        training = [WEEKDAY_NAMES.index(d) for d in days] if days else None
+        return {**validate_workout(data, profile.get("minutes_per_session"), body_weight, training), "model": model}
 
 
 def build_ai_service(settings) -> AIService:

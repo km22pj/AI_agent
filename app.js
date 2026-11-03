@@ -26,6 +26,8 @@
     }
     return el;
   }
+  // replaceChildren() prints null/false as the text "null"/"false"; this skips them (like h() does).
+  const fill = (el, ...kids) => el.replaceChildren(...kids.flat(Infinity).filter((k) => k != null && k !== false));
   const btn = (label, cls, onclick, extra = {}) => h("button", { type: "button", class: cls, onclick, ...extra }, label);
   const spinner = () => h("span", { class: "spinner", "aria-hidden": "true" });
 
@@ -104,6 +106,7 @@
   const fmtDate = (s, opts = { month: "long", day: "numeric" }) => new Intl.DateTimeFormat("ko-KR", { ...opts, timeZone: "UTC" }).format(utcDate(s));
   const fmtDateLong = (s) => fmtDate(s, { year: "numeric", month: "long", day: "numeric", weekday: "short" });
   const weekdayShort = (s) => fmtDate(s, { weekday: "short" });
+  const WEEKDAYS = ["월", "화", "수", "목", "금", "토", "일"]; // Mon=0, same as the server
   function fmtStamp(iso) {
     try {
       return new Intl.DateTimeFormat("ko-KR", { timeZone: userTz(), month: "long", day: "numeric", hour: "2-digit", minute: "2-digit" }).format(new Date(iso));
@@ -420,6 +423,7 @@
     }
     renderChrome();
     renderProfile();
+    loadNutrition();
     showScreen("today");
   }
 
@@ -452,10 +456,16 @@
     state.body = freshBody();
     state.gallery = freshGallery();
     state.workout = freshWorkout();
+    state.nutrition = null;
+    state.explaining = false;
+    state.explainError = null;
     state.mealForm = null;
     state.bodyForm = null;
     state.analyzing = new Set();
-    ["#meal-list", "#nutrition-body", "#trend-body", "#coach-body", "#food-flow", "#calendar-grid", "#body-day", "#settings-summary", "#week-days", "#view-dialog-body", "#view-dialog-foot", "#routine-body"].forEach((sel) => $(sel).replaceChildren());
+    ["#meal-list", "#nutrition-body", "#trend-body", "#coach-body", "#food-flow", "#calendar-grid", "#body-day", "#settings-summary", "#week-days", "#view-dialog-body", "#view-dialog-foot", "#routine-body", "#challenge-list", "#today-workout", "#today-nutrition", "#nutrition-panel"].forEach((sel) => $(sel).replaceChildren());
+    $("#challenge-level").textContent = "–";
+    $("#challenge-progress").textContent = "";
+    $("#challenge-basis").textContent = "기록을 불러오는 중이에요…";
     ["#meal-count", "#meal-analyzed-count", "#meal-pending-count", "#stat-movement", "#stat-meals", "#stat-body", "#stat-days", "#streak-days"].forEach((sel) => { $(sel).textContent = "–"; });
     $("#streak-copy").textContent = "기록을 불러오는 중이에요…";
     $("#sidebar-name").textContent = "나의 프로필";
@@ -469,7 +479,7 @@
     $("#compare-note").textContent = "기록을 불러오는 중이에요…";
     $("#day-complete").checked = false;
     resetComparePreview();
-    renderMissions(null);
+    renderTodayGoal(null);
   }
 
   // ------------------------------------------------------------------ navigation
@@ -484,6 +494,7 @@
     window.scrollTo({ top: 0, behavior: "smooth" });
     if (!state.user) return;
     if (name === "today" || name === "profile") loadOverview();
+    if (name === "profile") loadNutrition();
     if (name === "food") {
       if (!state.food.date) state.food.date = todayStr();
       loadFoodDay();
@@ -549,7 +560,8 @@
       ? `이번 주에 ${ov.week_record_days}일 나를 위한 기록을 남겼어요.`
       : "이번 주 기록이 아직 없어요. 오늘 하나 남겨 볼까요?";
     renderStreak(ov.streak);
-    renderMissions(ov.missions);
+    renderTodayGoal(ov.today_workout);
+    renderTodayNutrition(ov.nutrition);
 
     $("#stat-movement").textContent = `${ov.month.movement}회`;
     $("#stat-meals").textContent = `${ov.month.meals}회`;
@@ -560,6 +572,25 @@
       card.classList.toggle("locked", !earned);
       card.setAttribute("aria-label", `${card.querySelector("strong").textContent} ${earned ? "획득" : "아직 잠김"}`);
     });
+    renderChallenges(ov.challenges);
+  }
+
+  function renderChallenges(ch) {
+    if (!ch) return;
+    $("#challenge-level").textContent = `내 수준 · ${ch.level}`;
+    $("#challenge-progress").textContent = `${ch.done_count} / ${ch.total} 달성`;
+    $("#challenge-basis").textContent = `${ch.basis} · 저장된 기록으로 자동 계산돼요.`;
+    $("#challenge-list").replaceChildren(
+      ...ch.items.map((c) => h("div", { class: `challenge${c.done ? " done" : ""}`, "aria-label": `${c.title} ${c.done ? "달성" : `${c.current}/${c.target}`}` },
+        h("span", { class: "badge-icon", "aria-hidden": "true", text: c.icon }),
+        h("div", { style: "min-width:0" },
+          h("strong", { text: c.title }),
+          h("small", { text: `${c.period} · ${c.detail}` }),
+          h("div", { class: "challenge-bar" }, h("span", { style: `width:${Math.round((c.current / c.target) * 100)}%` })),
+          h("div", { class: "challenge-count", text: c.done ? "달성 ✓" : `${c.current} / ${c.target}` }),
+        ),
+      )),
+    );
   }
 
   function renderStreak(streak) {
@@ -575,64 +606,97 @@
       : (best ? `오늘 기록하면 새 연속 기록이 시작돼요.${bestText}` : "오늘 기록하면 연속 기록이 시작돼요.");
   }
 
-  function renderMissions(missions) {
-    const done = missions || { warmup: false, movement: false, record: false };
-    let count = 0;
-    $$(".mission[data-mission]").forEach((mission) => {
-      const key = mission.dataset.mission;
-      const isDone = Boolean(done[key]);
-      if (isDone) count += 1;
-      mission.classList.toggle("is-done", isDone);
-      const button = mission.querySelector(".mission-action");
-      button.textContent = isDone ? "완료 ✓" : key === "record" ? "기록하기" : "완료하기";
-      button.disabled = !missions;
-    });
-    $("#completed-count").textContent = String(count);
-    $("#ring-count").textContent = `${count}/3`;
-    $(".progress-fill").style.width = `${(count / 3) * 100}%`;
-    $(".progress-track").setAttribute("aria-valuenow", String(count));
+  // "오늘의 운동 목표": today's part of the weekly routine, one row per exercise.
+  function renderTodayGoal(tw) {
+    const box = $("#today-workout");
+    const isWorkout = Boolean(tw && tw.status === "workout");
+    const exercises = isWorkout ? tw.session.exercises : [];
+    const checked = new Set(isWorkout ? tw.checked || [] : []);
+    const done = exercises.filter((ex) => checked.has(ex.key)).length;
+    const total = exercises.length;
+    const pct = total ? Math.round((done / total) * 100) : 0; // today's goal completion rate
+
+    // progress bar in the card + ring on the right
+    $("#goal-progress-count").hidden = !isWorkout;
+    $("#goal-progress").hidden = !isWorkout;
+    $("#completed-count").textContent = String(done);
+    $("#total-count").textContent = String(total);
+    $("#goal-pct").textContent = `${pct}%`;
+    $(".progress-fill").style.width = `${pct}%`;
+    $("#goal-progress").setAttribute("aria-valuemax", String(total));
+    $("#goal-progress").setAttribute("aria-valuenow", String(done));
     const ring = $("#today-ring");
-    ring.style.setProperty("--progress", `${(count / 3) * 100}%`);
-    ring.setAttribute("aria-label", `오늘 목표 3개 중 ${count}개 완료`);
-    $("#rhythm-title").textContent = count === 3 ? "오늘 목표를 모두 채웠어요" : count ? "나만의 속도로 좋아요" : "가볍게 시작해 봐요";
-    $("#rhythm-copy").textContent = count ? "오늘의 작은 목표가 차곡차곡 쌓이고 있어요." : "오늘의 작은 목표를 하나씩 채워 봐요.";
-    const s = state.settings;
-    const minutes = (s && s.minutes_per_session) || 15;
-    const equipment = s && s.equipment && s.equipment.length ? `${s.equipment.slice(0, 2).join("·")} 활용` : "편안한 강도";
-    $("#movement-detail").textContent = `${minutes}분 · ${equipment}`;
+    ring.style.setProperty("--progress", `${pct}%`);
+    $("#ring-count").textContent = isWorkout ? `${pct}%` : tw && tw.status === "rest" ? "쉼" : "–";
+    ring.setAttribute("aria-label", isWorkout ? `오늘 운동 목표 ${pct}% 달성 (${total}개 중 ${done}개 완료)` : "오늘 운동 없음");
+    if (isWorkout) {
+      $("#rhythm-title").textContent = done === total ? "오늘 운동을 모두 마쳤어요" : done ? `오늘 목표 ${pct}% 달성` : "가볍게 시작해 봐요";
+      $("#rhythm-copy").textContent = done ? `운동 ${total}개 중 ${done}개를 완료했어요. 나만의 속도로 좋아요.` : "오늘의 운동을 하나씩 채워 봐요.";
+    } else if (tw && tw.status === "rest") {
+      $("#rhythm-title").textContent = "오늘은 쉬는 날";
+      $("#rhythm-copy").textContent = "충분히 쉬는 것도 운동의 일부예요.";
+    } else {
+      $("#rhythm-title").textContent = "나만의 속도로 좋아요";
+      $("#rhythm-copy").textContent = "바디 로그에서 운동 루틴을 받으면 오늘 할 운동이 보여요.";
+    }
+
+    if (!tw) { box.replaceChildren(); return; }
+    const dayLabel = `${WEEKDAYS[tw.weekday]}요일`;
+    if (tw.status === "rest") {
+      box.replaceChildren(h("div", { class: "tw-rest" }, h("strong", { text: "오늘은 쉬는 날" }), h("small", { text: `${dayLabel}은 휴식 요일이에요. 충분히 쉬는 것도 운동의 일부예요.` })));
+      return;
+    }
+    if (!isWorkout) {
+      const text = tw.status === "outdated" ? "주간 루틴을 요일별로 다시 받으면 오늘 할 운동이 여기에 보여요."
+        : tw.status === "unscheduled" ? `${dayLabel}이 운동하는 날로 바뀌었어요. 루틴을 다시 받으면 오늘 운동이 편성돼요.`
+        : "바디 로그에서 주간 운동 루틴을 받으면 오늘 할 운동이 여기에 목록으로 보여요.";
+      box.replaceChildren(h("div", { class: "tw-box" }, h("p", { style: "margin:0;font-size:12px;color:var(--muted)", text }),
+        h("div", { class: "notice-actions" }, btn(tw.status === "no_plan" ? "루틴 받으러 가기" : "루틴 다시 받기", "mini-button accent", () => showScreen("body")))));
+      return;
+    }
+    const s = tw.session;
+    box.replaceChildren(...[
+      h("p", { class: "tw-meta" }, h("strong", { text: `${dayLabel} · ${s.title}` }), [s.focus, `${s.minutes}분`, s.intensity].filter(Boolean).join(" · "), " ", h("span", { class: "tag indigo", text: "AI 추천 루틴" })),
+      h("div", { class: "mission-list" }, exercises.map((ex, i) => {
+        const isDone = checked.has(ex.key);
+        const load = ex.weight_kg ? `${fmt1(ex.weight_kg)}kg${ex.weight_note ? ` · ${ex.weight_note}` : ""}` : ex.weight_note || null;
+        const button = btn(isDone ? "완료 ✓" : "완료하기", "mission-action", () => toggleExercise(ex, !isDone, button), { "aria-pressed": String(isDone), "aria-label": `${ex.name} ${isDone ? "완료 취소" : "완료"}` });
+        return h("article", { class: `mission${isDone ? " is-done" : ""}` },
+          h("span", { class: "mission-icon", "aria-hidden": "true", text: String(i + 1) }),
+          h("span", { class: "mission-info" },
+            h("strong", null, `${ex.name}${ex.amount ? ` · ${ex.amount}` : ""}`, load ? h("span", { class: ex.weight_kg ? "load-chip" : "load-chip light", text: load }) : null),
+            ex.tip ? h("small", { text: ex.tip }) : null),
+          button);
+      })),
+      tw.stale ? h("p", { class: "hint", style: "margin:10px 0 0", text: "루틴을 받은 뒤 몸 상태나 휴식 요일이 바뀌었어요. 바디 로그에서 다시 받을 수 있어요." }) : null,
+    ].filter(Boolean)); // replaceChildren would print a null as the text "null"
   }
 
-  $$(".mission[data-mission] .mission-action").forEach((button) => {
-    button.addEventListener("click", async () => {
-      const key = button.closest(".mission").dataset.mission;
-      const ov = state.overview;
-      if (!ov) return;
-      if (key === "record") {
-        if (ov.missions.record) notify("오늘 남긴 기록이 있어요. 식사 화면에서 확인할 수 있어요.");
-        goToFood(todayStr(), !ov.missions.record);
-        return;
+  async function toggleExercise(ex, done, button) {
+    const ov = state.overview;
+    if (!ov) return;
+    const epoch = state.epoch;
+    await withBusy(button, "저장 중", async () => {
+      try {
+        const res = await api("/api/exercise-checks", { method: "PUT", body: { date: ov.today, item: ex.key, done } });
+        if (epoch !== state.epoch || !state.overview || !state.overview.today_workout) return;
+        state.overview.today_workout.checked = res.checked;
+        notify(done ? `${ex.name} 완료! 잘했어요.` : "완료 표시를 취소했어요.");
+      } catch (error) {
+        notify(error.message);
       }
-      const done = ov.missions[key];
-      const epoch = state.epoch;
-      await withBusy(button, "저장 중", async () => {
-        try {
-          if (done) await api(`/api/activities?date=${ov.today}&kind=${key}`, { method: "DELETE" });
-          else await api("/api/activities", { method: "POST", body: { date: ov.today, kind: key } });
-          if (epoch !== state.epoch) return;
-          notify(done ? "완료 표시를 취소했어요." : key === "warmup" ? "몸 풀기를 기록했어요. 좋은 시작이에요!" : "나에게 맞는 움직임을 기록했어요. 잘했어요!");
-        } catch (error) {
-          notify(error.message);
-        }
-      });
-      if (epoch === state.epoch) loadOverview();
     });
-  });
+    if (epoch === state.epoch) {
+      renderTodayGoal(state.overview && state.overview.today_workout);
+      loadOverview(); // streak, week dots and challenges count this as a movement day
+    }
+  }
 
   function settingsAreEmpty(s) {
     if (!s) return true;
     const targets = s.targets || {};
     const body = s.body || {};
-    return !s.goal_type && !s.experience && !(s.allergies || []).length && !(s.avoid_foods || []).length && !Object.values(targets).some((v) => v != null) && !s.food_preferences && body.height_cm == null && body.weight_kg == null;
+    return !s.goal_type && !s.experience && !(s.allergies || []).length && !(s.avoid_foods || []).length && !s.food_preferences && body.height_cm == null && body.weight_kg == null && s.age == null;
   }
 
   function renderProfile() {
@@ -645,22 +709,31 @@
     $("#profile-account-tag").textContent = user.is_dev ? "개발용 테스트 계정" : "Google 계정";
     $("#notify-toggle").setAttribute("aria-checked", String(Boolean(s.notifications)));
     $("#setup-banner").hidden = !settingsAreEmpty(s);
-    const t = s.targets || {};
+    const t = (state.nutrition && state.nutrition.current) || {};
     const targetText = NUTRIENTS.filter(([k]) => t[k] != null).map(([k, label, unit]) => `${label} ${fmtNum(t[k])}${unit}`).join(" · ");
+    const SEX = { male: "남성", female: "여성" };
+    const ACT = { sedentary: "주로 앉아서 지내요", light: "가볍게 자주 움직여요", active: "몸을 많이 쓰는 일을 해요" };
+    const SPECIAL = { none: "해당 없음", pregnant: "임신 또는 수유 중", medical: "의료진의 식이 관리 중" };
     const rows = [
       ["목표", goal || "설정 안 함"],
       ["현재 몸 상태", bodyText(s.body) || "설정 안 함"],
       ["운동 경험", s.experience || "설정 안 함"],
       ["사용 가능한 장비", [...(s.equipment || []), s.equipment_note].filter(Boolean).join(", ") || "설정 안 함"],
-      ["운동 계획", s.workouts_per_week != null || s.minutes_per_session != null ? `주 ${s.workouts_per_week ?? "?"}회 · ${s.minutes_per_session ?? "?"}분` : "설정 안 함"],
+      ["운동 계획", [
+        s.rest_days != null ? (s.rest_days.length ? `휴식 ${s.rest_days.map((d) => WEEKDAYS[d]).join("·")}` : "휴식 요일 없음") : null,
+        s.workouts_per_week != null ? `주 ${s.workouts_per_week}회` : null,
+        s.minutes_per_session != null ? `${s.minutes_per_session}분` : null,
+      ].filter(Boolean).join(" · ") || "설정 안 함"],
       ["식사 선호", s.food_preferences || "설정 안 함"],
       ["알레르기", (s.allergies || []).join(", ") || "없음"],
       ["피하고 싶은 음식", (s.avoid_foods || []).join(", ") || "없음"],
-      ["하루 영양 목표", targetText || "설정 안 함 (달성률 미표시)"],
+      ["계산용 정보", [s.age != null ? `만 ${s.age}세` : null, SEX[s.sex], ACT[s.activity_level], SPECIAL[s.special_condition]].filter(Boolean).join(" · ") || "설정 안 함"],
+      ["하루 영양 목표 (자동)", targetText || "계산 전 (달성률 미표시)"],
       ["시간대", userTz()],
     ];
     $("#settings-summary").replaceChildren(...rows.map(([label, value]) => h("div", null, h("span", { text: label }), value)));
-    renderMissions(state.overview ? state.overview.missions : null);
+    renderNutritionCard($("#nutrition-panel"));
+    renderTodayGoal(state.overview ? state.overview.today_workout : null);
   }
 
   function bodyText(body) {
@@ -672,8 +745,132 @@
     ].filter(Boolean).join(" · ");
   }
 
+  // ------------------------------------------------------------------ nutrition targets (calculated on the server)
+  async function loadNutrition() {
+    const epoch = state.epoch;
+    try {
+      const data = await api(`/api/nutrition-target?today=${todayStr()}`);
+      if (epoch !== state.epoch) return;
+      state.nutrition = data;
+      renderProfile();
+    } catch (error) {
+      if (epoch === state.epoch) $("#nutrition-panel").replaceChildren(errorNotice(error, loadNutrition));
+    }
+  }
+
+  const GOAL_TEXT = { loss: "감량 목표: 유지 열량에서 줄임", gain: "근육 증가 목표: 유지 열량 + 단백질 높임", maintain: "유지 목표: 유지 열량 그대로" };
+
+  function renderNutritionCard(box, { compact = false } = {}) {
+    const n = state.nutrition;
+    if (!n) { box.replaceChildren(loadingLine("영양 목표를 불러오는 중이에요…")); return; }
+    const cur = n.current;
+    const kids = [];
+    const setupNotice = () => {
+      if (n.setup.status === "ok") return null;
+      const text = n.setup.status === "missing" ? `자동 계산에 필요한 정보가 없어요: ${n.setup.missing.join(", ")}` : n.setup.message;
+      return h("div", { class: n.setup.status === "missing" ? "notice info" : "notice", style: "margin-top:8px" }, text,
+        compact ? null : h("div", { class: "notice-actions" }, btn("개인 설정 수정", "mini-button accent", openNutritionSettings)));
+    };
+    if (!cur) {
+      kids.push(h("p", { class: "hint", style: "margin:0", text: "아직 계산된 목표가 없어 달성률을 표시하지 않아요." }), setupNotice());
+      box.replaceChildren(...kids.filter(Boolean));
+      return;
+    }
+    const shares = (cur.basis && cur.basis.shares) || {};
+    const stat = (label, value, note) => h("div", { class: "stat-card" }, h("span", { text: label }), h("strong", { text: value }), h("small", { text: note }));
+    kids.push(
+      h("div", null,
+        h("span", { class: "tag sage", text: "개인 설정 기반 추정치" }), " ",
+        cur.source === "legacy" ? h("span", { class: "tag", text: "자동 계산 이전에 직접 입력한 값" }) : null),
+      h("div", { class: "nt-grid" },
+        stat("하루 열량", cur.kcal != null ? `${fmtNum(cur.kcal)}kcal` : "–", "목표"),
+        stat("탄수화물", cur.carbs_g != null ? `${fmtNum(cur.carbs_g)}g` : "–", shares.carbs != null ? `열량의 ${shares.carbs}%` : ""),
+        stat("단백질", cur.protein_g != null ? `${fmtNum(cur.protein_g)}g` : "–", shares.protein != null ? `열량의 ${shares.protein}%` : ""),
+        stat("지방", cur.fat_g != null ? `${fmtNum(cur.fat_g)}g` : "–", shares.fat != null ? `열량의 ${shares.fat}%` : "")),
+      h("p", { class: "hint", style: "margin:6px 0 0", text: `마지막 갱신 ${fmtStamp(cur.created_at)} · ${cur.source === "legacy" ? "자동 계산 전 날짜" : `${fmtDate(cur.effective_date, { year: "numeric", month: "long", day: "numeric" })}부터`} 적용` }),
+    );
+    kids.push(setupNotice());
+    const b = cur.basis;
+    if (!compact && b) {
+      kids.push(h("p", { class: "sub-title", text: "계산 근거 요약" }), h("ul", { class: "nt-basis" },
+        h("li", { text: `안정 시 에너지(Mifflin-St Jeor 식): ${fmtNum(b.rmr)}kcal — 키·몸무게·나이·성별로 계산` }),
+        h("li", { text: `평소 활동(운동 제외) ‘${b.activity_label}’ × ${b.pal} = ${fmtNum(b.daily_life)}kcal (${b.pal_note})` }),
+        h("li", { text: `계획한 운동 주 ${b.workout_days}회 × ${b.workout_minutes}분, ${b.exercise_met} MET → 하루 평균 +${fmtNum(b.exercise)}kcal (한 번만 더해요)` }),
+        h("li", { text: `유지 열량 ${fmtNum(b.maintenance)}kcal → 목표 ${fmtNum(cur.kcal)}kcal · ${GOAL_TEXT[b.goal_kind] || ""}` }),
+        h("li", { text: `단백질 체중 1kg당 ${b.protein_per_kg}g, 지방은 열량의 약 ${b.shares.fat}%, 나머지는 탄수화물 (모두 권장 비율 범위 안)` }),
+        h("li", { text: "골격근량은 제지방량과 다른 값이라 계산에 쓰지 않아요." }),
+        ...(b.notes || []).map((t) => h("li", { text: t })),
+      ));
+      // AI explanation (words only; the numbers above come from the server calculation)
+      if (cur.source === "auto") {
+        const exp = cur.explanation;
+        kids.push(h("p", { class: "sub-title" }, "쉽게 풀어 쓴 설명 ", h("span", { class: "tag indigo", text: "AI 작성 · 숫자는 서버 계산값" })));
+        if (state.explaining) kids.push(loadingLine("AI가 설명을 쓰는 중이에요…"));
+        else if (exp && cur.explanation_status === "ok") {
+          kids.push(h("p", { style: "margin:8px 0 0;font-size:12.5px;line-height:1.65", text: exp.summary }));
+          if (exp.notes.length) kids.push(h("ul", { class: "coach-list" }, exp.notes.map((t) => h("li", { text: t }))));
+          if (exp.caution) kids.push(h("div", { class: "notice", style: "margin-top:8px" }, exp.caution));
+        } else if (!state.config.ai_configured) {
+          kids.push(h("p", { class: "hint", text: "AI가 설정되지 않아 설명은 없어요. 위 계산 결과는 그대로 쓸 수 있어요." }));
+        } else {
+          if (state.explainError || cur.explanation_status === "failed") kids.push(h("div", { class: "notice", style: "margin-top:8px" }, `${state.explainError ? state.explainError.message : "설명을 만들지 못했어요."} 계산된 목표는 그대로 쓸 수 있어요.`));
+          kids.push(btn(cur.explanation_status === "failed" || state.explainError ? "설명 다시 받기" : "AI 설명 받기", "mini-button", requestExplanation, { style: "margin-top:8px" }));
+        }
+      }
+      kids.push(h("details", { style: "margin-top:12px;font-size:11px;color:var(--muted)" }, h("summary", { text: "계산식·기준 출처와 적용 범위" }),
+        h("ul", { class: "nt-history" }, (n.sources || []).map((s) => h("li", { text: s.title }))),
+        h("p", { style: "margin:6px 0 0", text: "적용 범위: 만 19~78세 성인. 임신·수유 중이거나 의료진의 식이 관리를 받는 경우, 저체중(BMI 18.5 미만)에서 감량하려는 경우에는 목표를 만들지 않아요. 계산값은 추정치라 실제 필요량과 다를 수 있어요." })));
+      const older = (n.history || []).filter((r) => r.id !== cur.id && r.status === "ok").slice(0, 4);
+      if (older.length) kids.push(h("p", { class: "sub-title", text: "이전 목표 (그 날짜들의 달성률에 그대로 쓰여요)" }), h("ul", { class: "nt-history" },
+        older.map((r) => h("li", { text: `${r.source === "legacy" ? "직접 입력" : `${fmtDate(r.effective_date)}부터`} · ${fmtNum(r.kcal || 0)}kcal · 탄 ${fmtNum(r.carbs_g || 0)}g · 단 ${fmtNum(r.protein_g || 0)}g · 지 ${fmtNum(r.fat_g || 0)}g` }))));
+    }
+    box.replaceChildren(...kids.filter(Boolean));
+  }
+
+  const openNutritionSettings = () => openSettings({ focus: "#set-age", section: "#set-body-section" });
+
+  async function requestExplanation() {
+    if (state.explaining || !state.config.ai_configured) return;
+    const epoch = state.epoch;
+    state.explaining = true;
+    state.explainError = null;
+    renderProfile();
+    try {
+      const data = await api("/api/nutrition-target/explain", { method: "POST", body: { today: todayStr() }, timeoutMs: AI_TIMEOUT_MS });
+      if (epoch !== state.epoch) return;
+      state.nutrition = data;
+    } catch (error) {
+      if (epoch !== state.epoch) return;
+      state.explainError = error;
+    }
+    state.explaining = false;
+    renderProfile();
+  }
+
+  function renderTodayNutrition(n) {
+    const box = $("#today-nutrition");
+    if (!n) { box.replaceChildren(); return; }
+    if (!n.current) {
+      $("#today-nutrition-sub").textContent = "개인 설정을 입력하면 자동으로 계산돼요";
+      box.replaceChildren(h("p", { class: "hint", style: "margin:0", text: n.setup.status === "missing" ? `필요한 정보: ${n.setup.missing.join(", ")}` : n.setup.message || "아직 계산된 목표가 없어요." }),
+        h("div", { class: "notice-actions" }, btn("개인 설정 입력", "mini-button accent", openNutritionSettings)));
+      return;
+    }
+    $("#today-nutrition-sub").textContent = `개인 설정 기반 추정치 · ${n.current.source === "legacy" ? "직접 입력한 값" : `${fmtDate(n.current.effective_date)}부터 적용`}`;
+    fill(box,
+      h("div", { class: "nt-rows" }, NUTRIENTS.map(([key, label, unit]) => {
+        const p = n.progress[key];
+        const pct = p.pct == null ? 0 : p.pct;
+        return h("div", { class: "nt-row" }, h("span", { text: label }),
+          h("div", { class: "challenge-bar" }, h("span", { style: `width:${Math.min(100, pct)}%` })),
+          h("span", null, h("b", { text: p.value == null ? "–" : fmtNum(p.value) }), ` / ${p.target == null ? "–" : fmtNum(p.target)}${unit}${p.pct == null ? "" : ` · ${p.pct}%`}`));
+      })),
+      n.uncounted ? h("p", { class: "hint", style: "margin:6px 0 0", text: `분석되지 않은 기록 ${n.uncounted}개는 합계에서 빠졌어요.` }) : null,
+    );
+  }
+
   // ------------------------------------------------------------------ settings form
-  function openSettings({ focus = null } = {}) {
+  function openSettings({ focus = null, section = "#set-body-section" } = {}) {
     const s = state.settings;
     if (!s) return;
     const body = s.body || {};
@@ -689,22 +886,43 @@
     );
     $$("#set-equipment input").forEach((input) => { input.checked = (s.equipment || []).includes(input.value); });
     $("#set-equipment-note").value = s.equipment_note || "";
-    $("#set-per-week").value = s.workouts_per_week ?? "";
+    // Rest days: an untouched, never-set picker is not sent, so saving other settings doesn't turn every day into a workout day.
+    state.restDirty = false;
+    $("#set-rest-days").replaceChildren(
+      ...WEEKDAYS.map((label, idx) => h("label", { class: "chip-option rest-chip" },
+        h("input", { type: "checkbox", value: String(idx), checked: (s.rest_days || []).includes(idx), onchange: () => { state.restDirty = true; updateRestHint(); } }),
+        h("span", { text: label }))),
+    );
+    updateRestHint();
     $("#set-minutes").value = s.minutes_per_session ?? "";
     $("#set-pref").value = s.food_preferences || "";
     $("#set-allergies").value = (s.allergies || []).join(", ");
     $("#set-avoid").value = (s.avoid_foods || []).join(", ");
-    const t = s.targets || {};
-    $("#set-kcal").value = t.kcal ?? "";
-    $("#set-carbs").value = t.carbs_g ?? "";
-    $("#set-protein").value = t.protein_g ?? "";
-    $("#set-fat").value = t.fat_g ?? "";
-    $("#set-timezone").textContent = `기록 날짜는 ${userTz()} 시간대 기준으로 계산해요.` + (s.targets_confirmed_at ? ` · 영양 목표 확인: ${fmtStamp(s.targets_confirmed_at)}` : "");
+    $("#set-age").value = s.age ?? "";
+    $("#set-sex").value = s.sex || "";
+    $("#set-activity").value = s.activity_level || "";
+    $("#set-special").value = s.special_condition || "";
+    renderNutritionCard($("#set-nutrition-card"), { compact: true });
+    $("#set-timezone").textContent = `기록 날짜는 ${userTz()} 시간대 기준으로 계산해요.`;
     showFormError("#settings-form-error", "");
     openDialog($("#settings-dialog"));
     if (focus) {
-      $("#set-body-section").scrollIntoView({ block: "start" });
+      $(section).scrollIntoView({ block: "start" });
       $(focus).focus({ preventScroll: true });
+    }
+  }
+
+  const selectedRestDays = () => $$("#set-rest-days input:checked").map((i) => Number(i.value));
+  function updateRestHint() {
+    const s = state.settings || {};
+    const rest = selectedRestDays();
+    const hint = $("#set-rest-hint");
+    if (!state.restDirty && s.rest_days == null) {
+      hint.textContent = `아직 정하지 않았어요. 쉬는 요일을 고르면 나머지 요일에 맞춰 주간 운동 루틴을 편성해요.${s.workouts_per_week ? ` (지금은 주 ${s.workouts_per_week}회 기준으로 고르게 배치)` : ""}`;
+    } else if (rest.length === 7) {
+      hint.textContent = "운동할 요일이 하루 이상 있어야 해요.";
+    } else {
+      hint.textContent = rest.length ? `${rest.map((d) => WEEKDAYS[d]).join("·")} 쉬고, 주 ${7 - rest.length}회 운동해요.` : "쉬는 요일 없이 매일 운동해요. 가벼운 날을 섞는 걸 추천해요.";
     }
   }
 
@@ -719,24 +937,31 @@
       experience: $("#set-experience").value,
       equipment: $$("#set-equipment input:checked").map((i) => i.value),
       equipment_note: $("#set-equipment-note").value,
-      workouts_per_week: numOrNull("#set-per-week"),
       minutes_per_session: numOrNull("#set-minutes"),
       food_preferences: $("#set-pref").value,
       allergies: $("#set-allergies").value,
       avoid_foods: $("#set-avoid").value,
-      targets: { kcal: numOrNull("#set-kcal"), carbs_g: numOrNull("#set-carbs"), protein_g: numOrNull("#set-protein"), fat_g: numOrNull("#set-fat") },
+      age: numOrNull("#set-age"),
+      sex: $("#set-sex").value,
+      activity_level: $("#set-activity").value,
+      special_condition: $("#set-special").value,
+      today: todayStr(), // a recalculated target takes effect from the user's today
       body: { height_cm: numOrNull("#set-height"), weight_kg: numOrNull("#set-weight"), skeletal_muscle_kg: numOrNull("#set-muscle"), condition_note: $("#set-condition").value },
     };
+    if (state.restDirty || state.settings.rest_days != null) payload.rest_days = selectedRestDays();
     await withBusy($("#settings-save"), "저장 중", async () => {
       try {
         const res = await api("/api/settings", { method: "PUT", body: payload });
         if (epoch !== state.epoch) return;
         state.settings = res.settings;
+        state.nutrition = res.nutrition;
         closeDialog($("#settings-dialog"));
         renderProfile();
-        notify("개인 설정을 저장했어요.");
+        notify(res.nutrition_changed ? (res.nutrition.current ? "개인 설정을 저장하고 하루 영양 목표를 다시 계산했어요." : "개인 설정을 저장했어요. 영양 목표는 필요한 정보가 있어야 계산돼요.") : "개인 설정을 저장했어요.");
+        if (res.nutrition_changed && res.nutrition.current && res.nutrition.current.source === "auto") requestExplanation();
         if (state.food.date && $("#screen-food").classList.contains("active")) loadFoodDay({ keep: true });
         if ($("#screen-body").classList.contains("active")) loadWorkout();
+        loadOverview(); // rest days change today's workout and the challenge targets
       } catch (error) {
         showFormError("#settings-form-error", error.message);
       }
@@ -992,7 +1217,9 @@
       kids.push(h("div", { class: "notice" }, `분석되지 않았거나 일부 정보가 없는 기록이 있어 합계가 불완전해요. (합계 제외 ${summary.uncounted}개)`));
     }
     if (!summary.has_targets) {
-      kids.push(h("div", { class: "notice info" }, "영양 목표가 설정되지 않아 달성률은 표시하지 않아요.", h("div", { class: "notice-actions" }, btn("영양 목표 설정", "mini-button", openSettings))));
+      kids.push(h("div", { class: "notice info" }, "이 날짜에 적용된 영양 목표가 없어 달성률은 표시하지 않아요. 개인 설정을 입력하면 자동으로 계산돼요.", h("div", { class: "notice-actions" }, btn("개인 설정 수정", "mini-button", openNutritionSettings))));
+    } else if (day.target) {
+      kids.push(h("p", { class: "hint", style: "margin-top:6px", text: `목표: 개인 설정 기반 추정치 (${day.target.source === "legacy" ? "자동 계산 이전에 직접 입력한 값" : `${fmtDate(day.target.effective_date)}부터 적용`}, 갱신 ${fmtStamp(day.target.created_at)})` }));
     }
     body.replaceChildren(...kids);
   }
@@ -1051,7 +1278,7 @@
     }
     for (const q of summary.questions) {
       const action =
-        q.id === "set_targets" ? btn("목표 설정", "mini-button", openSettings) :
+        q.id === "set_targets" ? btn("개인 설정 수정", "mini-button", openNutritionSettings) :
         q.id === "mark_complete" ? btn("모두 기록했어요", "mini-button accent", () => setDayComplete(true)) : null;
       kids.push(h("div", { class: "notice info" }, q.text, action ? h("div", { class: "notice-actions" }, action) : null));
     }
@@ -1181,7 +1408,7 @@
     if (meal.memo) kids.push(h("p", { class: "sub-title", text: "메모" }), h("p", { class: "detail-note", text: meal.memo }));
     $("#view-dialog-body").replaceChildren(...kids);
     const canAnalyze = state.config.ai_configured && status !== "pending";
-    $("#view-dialog-foot").replaceChildren(
+    fill($("#view-dialog-foot"),
       btn("삭제", "quiet-button danger-text", () => deleteMeal(meal)),
       btn("수정", "quiet-button", () => { closeDialog(dialog); openMealForm({ meal }); }),
       canAnalyze ? btn(status === "ai" ? "다시 분석" : "AI 분석", "secondary-button", () => { analyzeMeal(meal.id); openMealDetail(meal.id); }) : null,
@@ -1730,7 +1957,7 @@
       h("div", { class: "detail-meta" }, h("span", { class: "status-chip user", text: "저장됨" }), h("span", { class: "status-chip", text: `${fmtStamp(log.created_at)} 저장` }), log.updated_at !== log.created_at ? h("span", { class: "status-chip", text: `${fmtStamp(log.updated_at)} 수정` }) : null),
       h("p", { class: "detail-note", text: log.note || "(메모 없음)" }),
     );
-    $("#view-dialog-foot").replaceChildren(
+    fill($("#view-dialog-foot"),
       fromGallery ? btn("모아보기로 돌아가기", "quiet-button", renderGallery) : null,
       btn("삭제", "quiet-button danger-text", () => deleteBodyLog(log)),
       btn("수정", "quiet-button", () => { closeDialog(dialog); openBodyForm({ log }); }),
@@ -1909,6 +2136,15 @@
   }
 
   // ------------------------------------------------------------------ body: workout routine
+  const todayWeekday = () => (utcDate(todayStr()).getUTCDay() + 6) % 7; // Mon=0 ... Sun=6
+  const openRestDays = () => openSettings({ focus: "#set-rest-days input", section: "#set-rest-section" });
+
+  function exerciseList(exercises) {
+    return h("ol", null, exercises.map((ex) => {
+      const load = ex.weight_kg ? `${fmt1(ex.weight_kg)}kg${ex.weight_note ? ` · ${ex.weight_note}` : ""}` : ex.weight_note || null;
+      return h("li", null, `${ex.name}${ex.amount ? ` · ${ex.amount}` : ""}`, load ? h("span", { class: ex.weight_kg ? "load-chip" : "load-chip light", text: load }) : null, ex.tip ? h("small", { text: ex.tip }) : null);
+    }));
+  }
   async function loadWorkout() {
     const w = state.workout;
     const epoch = state.epoch;
@@ -1916,7 +2152,7 @@
     w.error = null;
     if (!w.data) renderRoutine();
     try {
-      const data = await api("/api/workout-plan");
+      const data = await api(`/api/workout-plan?today=${todayStr()}`); // a new week may adjust the routine (no AI)
       if (epoch !== state.epoch || token !== w.token) return;
       w.data = data;
     } catch (error) {
@@ -1951,7 +2187,13 @@
       return;
     }
 
-    kids.push(h("p", { class: "sub-title" }, "이번 주 운동 루틴 ", h("span", { class: "tag indigo", text: "AI 추천 · 참고용" })));
+    kids.push(h("p", { class: "sub-title" }, "이번 주 운동 루틴 (월~일) ", h("span", { class: "tag indigo", text: "AI 추천 · 참고용" })));
+    const sched = w.data.schedule;
+    const dayNames = (list) => list.map((d) => WEEKDAYS[d]).join("·");
+    const schedText = sched.source === "rest_days"
+      ? `운동 ${dayNames(sched.training_days)} · 쉬는 날 ${sched.rest_days.length ? dayNames(sched.rest_days) : "없음"}`
+      : `휴식 요일을 아직 정하지 않아 주 ${sched.training_days.length}회(${dayNames(sched.training_days)})로 고르게 배치해요. 쉬는 요일을 고르면 그에 맞춰 편성해요.`;
+    kids.push(h("div", { class: "notice info", style: "margin-top:8px" }, schedText, h("div", { class: "notice-actions" }, btn("휴식 요일 바꾸기", "mini-button", openRestDays))));
     if (!state.config.ai_configured) {
       kids.push(h("div", { class: "notice", style: "margin-top:8px" }, `AI 분석이 설정되지 않아 운동 루틴을 추천할 수 없어요. 서버에 ${state.config.ai_key_name || "AI API 키"}를 설정하면 사용할 수 있어요.`));
       box.replaceChildren(...kids);
@@ -1959,17 +2201,43 @@
     }
     if (plan) {
       if (plan.stale) kids.push(h("div", { class: "notice", style: "margin-top:8px" }, "이 루틴을 받은 뒤 몸 상태나 운동 설정이 바뀌었어요. 다시 받으면 최신 값이 반영돼요."));
+      const adj = (plan.adjustments || [])[0];
+      if (adj) {
+        const LEVEL = { decrease: "강도를 낮췄어요", increase: "강도와 양을 늘렸어요", keep: "지금 강도를 유지해요" };
+        kids.push(h("div", { class: `notice${adj.level === "keep" ? " info" : ""}`, style: "margin-top:8px" },
+          h("strong", { text: `지난주 운동 달성률 ${Math.round(adj.rate * 100)}% (${adj.planned}개 중 ${adj.done}개 완료) → ${LEVEL[adj.level]}` }),
+          adj.changes && adj.changes.length ? h("ul", { style: "margin:6px 0 0;padding-left:18px;font-size:11.5px" }, adj.changes.map((c) => h("li", { text: c }))) : null,
+          h("p", { class: "hint", style: "margin:6px 0 0", text: `${fmtDate(adj.applied_week)} 주에 ${adj.source === "ai" ? "새 루틴을 받으며" : "자동으로"} 반영했어요. 기준: 절반 미만 완료 → 낮춤, 모두 완료 → 늘림 (앱 규칙). 중량 증가는 ACSM 권고(2~10%) 안에서만 해요.` })));
+      } else {
+        kids.push(h("p", { class: "hint", style: "margin-top:8px", text: "매주 월요일, 지난주 ‘오늘의 운동 목표’ 완료율을 보고 루틴 강도를 자동으로 조정해요 (절반 미만 → 낮춤, 모두 완료 → 늘림)." }));
+      }
       if (plan.summary) kids.push(h("p", { style: "margin:10px 0 0;font-size:13px;line-height:1.65", text: plan.summary }));
-      kids.push(
-        h("div", { class: "session-grid" }, plan.sessions.map((s) => h("div", { class: "session-card" },
-          h("h4", { text: s.title }),
-          h("p", { class: "session-meta", text: [s.focus, `${s.minutes}분`, s.intensity].filter(Boolean).join(" · ") }),
-          h("ol", null, s.exercises.map((ex) => h("li", null, `${ex.name}${ex.amount ? ` · ${ex.amount}` : ""}`, ex.tip ? h("small", { text: ex.tip }) : null))),
-        ))),
+      const todayIdx = todayWeekday();
+      const sessionCard = (s) => h("div", { class: `session-card${s.weekday === todayIdx ? " today" : ""}` },
+        h("h4", null, s.weekday != null ? `${WEEKDAYS[s.weekday]}요일 · ${s.title}` : s.title, s.weekday === todayIdx ? h("span", { class: "tag indigo", style: "margin-left:6px", text: "오늘" }) : null),
+        h("p", { class: "session-meta", text: [s.focus, `${s.minutes}분`, s.intensity].filter(Boolean).join(" · ") }),
+        exerciseList(s.exercises),
       );
+      if ((plan.format || 1) >= 3) {
+        const byDay = new Map(plan.sessions.map((s) => [s.weekday, s]));
+        kids.push(h("div", { class: "week-plan" }, WEEKDAYS.map((label, d) => (byDay.has(d)
+          ? sessionCard(byDay.get(d))
+          : h("div", { class: `session-card rest${d === todayIdx ? " today" : ""}` }, h("div", null, h("strong", { style: "display:block;font-size:13px", text: `${label}요일` }), h("span", { style: "font-size:12px", text: "쉬는 날" })))))));
+      } else {
+        kids.push(h("div", { class: "session-grid" }, plan.sessions.map(sessionCard)));
+      }
+      const hasLoads = plan.sessions.some((s) => s.exercises.some((ex) => ex.weight_kg));
+      const loadGear = ["덤벨", "케틀벨", "헬스장"];
+      if ((plan.format || 1) < 3) {
+        kids.push(h("div", { class: "notice info", style: "margin-top:10px" }, "요일별 편성과 운동별 시작 중량(kg)이 추가됐어요. ‘루틴 다시 받기’를 누르면 반영돼요."));
+      } else if (hasLoads) {
+        kids.push(h("p", { class: "hint", style: "margin-top:8px", text: "중량은 AI가 몸 상태와 운동 경험으로 추정한 시작값이에요. 마지막 2~3회가 힘든 정도면 적당하고, 자세가 무너지면 낮추세요." }));
+      } else if (!(state.settings?.equipment || []).some((e) => loadGear.includes(e))) {
+        kids.push(h("p", { class: "hint", style: "margin-top:8px", text: "지금 장비로는 맨몸 운동만 추천돼요. 개인 설정의 장비에 덤벨·케틀벨·헬스장을 추가하면 중량 운동과 시작 중량도 함께 추천돼요." }));
+      }
+      if (plan.dropped_weights) kids.push(h("p", { class: "hint", style: "margin-top:6px", text: `안전 범위를 벗어난 중량 ${plan.dropped_weights}개는 표시하지 않았어요.` }));
       if (plan.cautions.length) kids.push(h("ul", { class: "coach-list" }, plan.cautions.map((c) => h("li", { text: c }))));
       if (plan.filtered_exercises) kids.push(h("p", { class: "hint", style: "margin-top:6px", text: `안전하지 않은 표현이 담긴 동작 ${plan.filtered_exercises}개는 제외했어요.` }));
-      if (plan.questions.length) kids.push(h("div", { class: "ai-questions", style: "margin-top:10px" }, h("strong", { text: "더 맞춤화된 루틴을 위해 알려주세요" }), h("ul", null, plan.questions.map((q) => h("li", { text: q })))));
       kids.push(h("p", { class: "hint", style: "margin-top:8px", text: `${fmtStamp(plan.created_at)} 생성 · ${plan.model || "AI"} · 통증이 있으면 멈추고, 질환이 있다면 전문가와 먼저 상의하세요.` }));
     } else {
       kids.push(h("p", { class: "hint", style: "margin-top:8px", text: "몸 상태와 목표·운동 경험·장비·운동 계획을 바탕으로 이번 주 루틴을 만들어요." }));
@@ -1989,10 +2257,11 @@
     w.requestError = null;
     renderRoutine();
     try {
-      const data = await api("/api/workout-plan", { method: "POST", body: {}, timeoutMs: AI_TIMEOUT_MS });
+      const data = await api("/api/workout-plan", { method: "POST", body: { today: todayStr() }, timeoutMs: AI_TIMEOUT_MS });
       if (epoch !== state.epoch) return;
       w.data = data;
       w.token += 1; // a slower GET started earlier must not overwrite the new plan
+      loadOverview(); // today's workout on the Today tab
     } catch (error) {
       if (epoch !== state.epoch) return;
       w.requestError = error;
@@ -2017,6 +2286,8 @@
     if (action === "logout") logout();
     else if (action === "open-settings") openSettings();
     else if (action === "edit-body") openSettings({ focus: "#set-height" });
+    else if (action === "edit-rest") openRestDays();
+    else if (action === "edit-nutrition") openNutritionSettings();
     else if (action === "add-meal") openMealForm({ date: state.food.date || todayStr() });
     else if (action === "add-meal-today") goToFood(todayStr(), true);
     else if (action === "body-new-photo") openBodyForm({ date: todayStr(), pickPhoto: true });
@@ -2032,12 +2303,12 @@
     state.bodyForm = null;
   });
   $("#notification-button").addEventListener("click", () => notify("알림 설정은 ‘내 기록’에서 바꿀 수 있어요. (알림 발송 기능은 아직 없어요)"));
-  $("#badge-info").addEventListener("click", () => notify("배지는 저장된 기록으로 자동으로 열려요: 첫 기록, 4일 이상 쉬었다가 다시 기록, 한 주에 3일 이상 기록."));
+  $("#badge-info").addEventListener("click", () => notify("배지는 저장된 기록으로 자동으로 열려요: 첫 기록, 4일 이상 쉬었다가 다시 기록, 한 주에 3일 이상 기록. 도전과제는 운동 경험(입문·초급·중급·상급)에 맞춰 목표가 달라지고, 주간 과제는 매주 월요일, 월간 과제는 매월 1일에 새로 시작해요."));
   $("#privacy-info").addEventListener("click", () => notify(`기록과 사진은 이 서버에 내 계정으로만 저장돼요. AI 분석을 요청할 때만 사진과 식사 정보가 AI 서비스(${(state.config && state.config.ai_provider_name) || "AI 서비스"})로 전송돼요.`));
 
   // ------------------------------------------------------------------ boot
   async function boot() {
-    renderMissions(null);
+    renderTodayGoal(null);
     resetComparePreview();
     try {
       state.config = await api("/api/config");

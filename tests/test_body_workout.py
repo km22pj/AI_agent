@@ -4,7 +4,7 @@ from datetime import date
 
 from backend.ai import AIError, validate_workout
 from backend.app import App
-from backend.logic import ValidationError, body_metrics, default_settings, normalize_settings
+from backend.logic import ValidationError, body_metrics, build_challenges, default_settings, normalize_settings, training_schedule
 from tests.test_api import ServerTestCase
 
 
@@ -75,11 +75,21 @@ class WorkoutApiTests(ServerTestCase):
         self.assertEqual(sent["cautions_from_user"], "무릎 통증")
         self.assertNotIn("email", str(sent))
         plan = body["plan"]
-        self.assertEqual(len(plan["sessions"]), 2)
+        # No rest days chosen yet: 2 workouts spread over the week (Mon, Thu).
+        self.assertEqual(sent["training_weekdays"], ["월", "목"])
+        self.assertEqual([s["weekday"] for s in plan["sessions"]], [0, 3])
+        self.assertEqual(body["schedule"]["source"], "auto")
         self.assertTrue(all(s["minutes"] == 30 for s in plan["sessions"]))
         names = [e["name"] for s in plan["sessions"] for e in s["exercises"]]
         self.assertNotIn("벌칙 버피", names)
         self.assertEqual(plan["filtered_exercises"], 2)
+        # Weights: rounded to 0.5kg, bodyweight moves have none, unsafe loads (400kg) are dropped.
+        loads = {e["name"]: (e["weight_kg"], e["weight_note"]) for e in plan["sessions"][0]["exercises"]}
+        self.assertEqual(loads["덤벨 스쿼트"], (4.0, "한 손 기준"))
+        self.assertEqual(loads["제자리 걷기"], (None, "맨몸"))
+        self.assertEqual(loads["바벨 데드리프트"][0], None)
+        self.assertEqual(plan["dropped_weights"], 2)
+        self.assertEqual(plan["format"], 3)
         self.assertNotIn("태워야", plan["summary"])
         self.assertFalse(plan["stale"])
         self.assertEqual(plan["model"], "fake-model")
@@ -98,6 +108,153 @@ class WorkoutApiTests(ServerTestCase):
         status, body = a.post("/api/workout-plan", {})
         self.assertEqual(status, 502)
         self.assertIsNone(a.get("/api/workout-plan")[1]["plan"])
+
+
+class RestDayTests(unittest.TestCase):
+    def test_rest_days_validation_and_count(self):
+        s = normalize_settings({"rest_days": [6, 2, 2]}, default_settings(), "T")
+        self.assertEqual((s["rest_days"], s["workouts_per_week"]), ([2, 6], 5))
+        self.assertEqual(normalize_settings({"rest_days": []}, s, "T")["workouts_per_week"], 7)
+        self.assertIsNone(normalize_settings({"rest_days": None}, s, "T")["rest_days"])
+        for bad in ([0, 1, 2, 3, 4, 5, 6], [7], ["월"], [True], "2"):
+            with self.subTest(bad=bad), self.assertRaises(ValidationError):
+                normalize_settings({"rest_days": bad}, default_settings(), "T")
+
+    def test_schedule_from_rest_days_or_spread_evenly(self):
+        self.assertEqual(training_schedule({"rest_days": [2, 6]})["training_days"], [0, 1, 3, 4, 5])
+        self.assertEqual(training_schedule({"rest_days": None, "workouts_per_week": 3})["training_days"], [0, 2, 4])
+        self.assertEqual(training_schedule({"rest_days": None, "workouts_per_week": 5})["training_days"], [0, 1, 2, 4, 5])
+        self.assertEqual(training_schedule({"rest_days": None, "workouts_per_week": None})["source"], "auto")
+
+    def test_plan_must_cover_every_training_day(self):
+        base = {"summary": "", "cautions": [], "questions": [], "sessions": [
+            {"weekday": "월", "title": "하체", "focus": "", "minutes": 30, "intensity": "보통",
+             "exercises": [{"name": "스쿼트", "amount": "2세트", "weight_kg": 0, "weight_note": "", "tip": ""}]}]}
+        self.assertEqual(validate_workout(base, training_days=[0])["sessions"][0]["weekday"], 0)
+        with self.assertRaises(AIError):
+            validate_workout(base, training_days=[0, 2])  # Wednesday missing
+
+
+def next_weekday(start: date, weekday: int) -> str:
+    from datetime import timedelta
+    return (start + timedelta(days=(weekday - start.weekday()) % 7)).isoformat()
+
+
+class WeeklyRoutineApiTests(ServerTestCase):
+    def setUp(self):
+        super().setUp()
+        self.a = self.login()
+        self.a.put("/api/settings", {"rest_days": [2, 6], "body": {"height_cm": 170, "weight_kg": 65}})
+
+    def today_workout(self, weekday):
+        return self.a.get(f"/api/overview?today={next_weekday(date(2026, 11, 2), weekday)}")[1]["today_workout"]
+
+    def test_rest_days_shape_the_week_and_today(self):
+        self.assertEqual(self.today_workout(0)["status"], "no_plan")
+        self.assertEqual(self.today_workout(2)["status"], "rest")  # rest day even before any routine exists
+        self.fake.workout_extra_day = True  # the AI also puts a session on Sunday (a rest day)
+        status, body = self.a.post("/api/workout-plan", {})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(self.fake.last_workout_input["training_weekdays"], ["월", "화", "목", "금", "토"])
+        self.assertEqual(self.fake.last_workout_input["rest_weekdays"], ["수", "일"])
+        self.assertEqual([s["weekday"] for s in body["plan"]["sessions"]], [0, 1, 3, 4, 5])
+        monday = self.today_workout(0)
+        self.assertEqual(monday["status"], "workout")
+        self.assertEqual(monday["session"]["title"], "월요일 전신")
+        self.assertEqual(self.today_workout(6)["status"], "rest")
+        # Wednesday becomes a workout day: no session for it yet, and the routine is marked stale.
+        self.a.put("/api/settings", {"rest_days": [6]})
+        wednesday = self.today_workout(2)
+        self.assertEqual((wednesday["status"], wednesday["stale"]), ("unscheduled", True))
+        # Monday becomes a rest day: the user's rest day wins over the older routine.
+        self.a.put("/api/settings", {"rest_days": [0, 6]})
+        self.assertEqual(self.today_workout(0)["status"], "rest")
+
+
+class ExerciseCheckTests(ServerTestCase):
+    def test_checking_exercises_counts_as_a_movement_day(self):
+        a = self.login()
+        a.put("/api/settings", {"rest_days": [2, 6], "body": {"height_cm": 170, "weight_kg": 65}})
+        a.post("/api/workout-plan", {})
+        monday = next_weekday(date(2026, 11, 2), 0)
+        ov = a.get(f"/api/overview?today={monday}")[1]
+        tw = ov["today_workout"]
+        keys = [ex["key"] for ex in tw["session"]["exercises"]]
+        self.assertEqual((tw["checked"], ov["missions"]["movement"]), ([], False))
+        status, body = a.put("/api/exercise-checks", {"date": monday, "item": keys[0], "done": True})
+        self.assertEqual((status, body["checked"]), (200, [keys[0]]))
+        ov = a.get(f"/api/overview?today={monday}")[1]
+        self.assertTrue(ov["missions"]["movement"])
+        self.assertEqual(ov["streak"]["current"], 1)
+        self.assertEqual(next(i for i in ov["challenges"]["items"] if i["id"] == "movement_week")["current"], 1)
+        # Checking it twice is harmless; un-checking the last one removes the movement day again.
+        a.put("/api/exercise-checks", {"date": monday, "item": keys[0], "done": True})
+        a.put("/api/exercise-checks", {"date": monday, "item": keys[0], "done": False})
+        ov = a.get(f"/api/overview?today={monday}")[1]
+        self.assertEqual((ov["today_workout"]["checked"], ov["missions"]["movement"]), ([], False))
+
+    def test_rejects_items_not_in_todays_routine(self):
+        a = self.login()
+        a.put("/api/settings", {"rest_days": [2, 6], "body": {"height_cm": 170, "weight_kg": 65}})
+        a.post("/api/workout-plan", {})
+        monday, wednesday = next_weekday(date(2026, 11, 2), 0), next_weekday(date(2026, 11, 2), 2)
+        for body in ({"date": monday, "item": "99:없는 운동", "done": True},
+                     {"date": wednesday, "item": "0:제자리 걷기", "done": True},  # rest day
+                     {"date": monday, "item": "0:제자리 걷기", "done": "yes"}):
+            with self.subTest(body=body):
+                self.assertEqual(a.put("/api/exercise-checks", body)[0], 400)
+        # Another account can't tick this user's routine.
+        b = self.login("사용자B")
+        self.assertEqual(b.put("/api/exercise-checks", {"date": monday, "item": "0:제자리 걷기", "done": True})[0], 400)
+
+
+class StaleServerTests(ServerTestCase):
+    def test_unknown_api_says_restart_when_code_changed_after_start(self):
+        a = self.login()
+        status, body = a.get("/api/no-such-thing")
+        self.assertEqual((status, body["error"]["code"]), (404, "not_found"))
+        self.server.app._started_code_stamp = 0  # pretend the code on disk is newer than the running server
+        status, body = a.get("/api/no-such-thing")
+        self.assertEqual((status, body["error"]["code"]), (404, "restart_needed"))
+        self.assertIn("다시 시작", body["error"]["message"])
+
+
+class ChallengeTests(unittest.TestCase):
+    M = {"total_record_days": 2, "best_streak": 2, "movement_week": 1, "meals_week": 5, "body_month": 0, "days_month": 2, "has_plan": False}
+
+    def test_level_follows_experience_and_targets_scale(self):
+        beginner = build_challenges({"experience": "처음이에요"}, self.M)
+        advanced = build_challenges({"experience": "2년 이상"}, self.M)
+        self.assertEqual((beginner["level"], advanced["level"]), ("입문", "상급"))
+        target = lambda ch, cid: next(i["target"] for i in ch["items"] if i["id"] == cid)  # noqa: E731
+        self.assertLess(target(beginner, "streak"), target(advanced, "streak"))
+        self.assertLess(target(beginner, "meals_week"), target(advanced, "meals_week"))
+        self.assertIn("first_plan", [i["id"] for i in beginner["items"]])
+        self.assertNotIn("first_plan", [i["id"] for i in advanced["items"]])
+        meals = next(i for i in beginner["items"] if i["id"] == "meals_week")
+        self.assertEqual((meals["current"], meals["done"]), (5, True))
+        self.assertEqual(beginner["done_count"], 1)
+
+    def test_without_experience_level_comes_from_history_and_plan_sets_movement(self):
+        self.assertEqual(build_challenges({}, self.M)["level"], "입문")
+        self.assertEqual(build_challenges({}, {**self.M, "total_record_days": 40})["level"], "중급")
+        ch = build_challenges({"experience": "6개월 미만", "workouts_per_week": 5}, self.M)
+        move = next(i for i in ch["items"] if i["id"] == "movement_week")
+        self.assertEqual((ch["level"], move["target"], move["current"]), ("초급", 5, 1))
+
+
+class ChallengeApiTests(ServerTestCase):
+    def test_overview_counts_stored_records(self):
+        a = self.login()
+        a.put("/api/settings", {"experience": "처음이에요"})
+        for day in ("2026-11-02", "2026-11-03"):
+            self.create_meal(a, date=day)
+        a.post("/api/activities", {"date": "2026-11-03", "kind": "movement"})
+        ch = a.get("/api/overview?today=2026-11-03")[1]["challenges"]
+        items = {i["id"]: i for i in ch["items"]}
+        self.assertEqual(ch["level"], "입문")
+        self.assertEqual((items["meals_week"]["current"], items["movement_week"]["current"], items["streak"]["current"]), (2, 1, 2))
+        self.assertFalse(items["first_plan"]["done"])
 
 
 class WorkoutWithoutAITests(ServerTestCase):
