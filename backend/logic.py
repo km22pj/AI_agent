@@ -113,7 +113,49 @@ def default_settings() -> dict:
         # Current body status, entered by the user (used for workout routine suggestions).
         "body": {"height_cm": None, "weight_kg": None, "skeletal_muscle_kg": None, "condition_note": ""},
         "body_updated_at": None,
+        # Weekdays off (0=월 ... 6=일). None = not chosen yet, [] = no rest day.
+        "rest_days": None,
+        # Needed only for the automatic nutrition targets (see backend/nutrition.py).
+        "age": None,
+        "sex": "",                # "male" | "female": the equation has sex-specific constants
+        "activity_level": "",     # daily life WITHOUT planned exercise
+        "special_condition": "",  # "none" | "pregnant" | "medical"
     }
+
+
+WEEKDAYS = ["월", "화", "수", "목", "금", "토", "일"]
+SEX_VALUES = {"", "male", "female"}
+ACTIVITY_VALUES = {"", "sedentary", "light", "active"}
+SPECIAL_VALUES = {"", "none", "pregnant", "medical"}
+
+
+def parse_rest_days(value) -> list[int] | None:
+    if value is None:
+        return None
+    if not isinstance(value, list):
+        raise ValidationError("휴식 요일 값이 올바르지 않아요.")
+    days = set()
+    for v in value:
+        if isinstance(v, bool) or not isinstance(v, int) or not 0 <= v <= 6:
+            raise ValidationError("휴식 요일 값이 올바르지 않아요.")
+        days.add(v)
+    if len(days) == 7:
+        raise ValidationError("운동할 요일이 하루 이상 있어야 해요. 휴식 요일을 줄여 주세요.")
+    return sorted(days)
+
+
+def training_schedule(settings: dict) -> dict:
+    """Which weekdays (Mon=0) get a workout. From the chosen rest days, or spread evenly
+    over the week from workouts_per_week when no rest days were chosen yet."""
+    rest = settings.get("rest_days")
+    if rest is not None:
+        days = [d for d in range(7) if d not in rest]
+        source = "rest_days"
+    else:
+        n = max(1, min(7, int(settings.get("workouts_per_week") or 3)))
+        days = [i * 7 // n for i in range(n)]
+        source = "auto"
+    return {"training_days": days, "rest_days": [d for d in range(7) if d not in days], "source": source}
 
 
 def default_body() -> dict:
@@ -188,18 +230,26 @@ def normalize_settings(raw: dict, previous: dict, now: str) -> dict:
     if "avoid_foods" in raw:
         out["avoid_foods"] = string_list(raw["avoid_foods"], 30, 40, "피하고 싶은 음식")
     if "targets" in raw:
-        targets_raw = raw["targets"] or {}
-        if not isinstance(targets_raw, dict):
-            raise ValidationError("영양 목표 값이 올바르지 않아요.")
-        targets = {
-            "kcal": optional_number(targets_raw.get("kcal"), 1000, 6000, "열량 목표(kcal)"),
-            "carbs_g": optional_number(targets_raw.get("carbs_g"), 20, 900, "탄수화물 목표(g)"),
-            "protein_g": optional_number(targets_raw.get("protein_g"), 20, 400, "단백질 목표(g)"),
-            "fat_g": optional_number(targets_raw.get("fat_g"), 10, 300, "지방 목표(g)"),
-        }
-        if targets != merged["targets"]:
-            out["targets_confirmed_at"] = now if any(v is not None for v in targets.values()) else None
-        out["targets"] = targets
+        raise ValidationError("하루 영양 목표는 개인 설정으로 자동 계산돼요. 키·몸무게·나이 등 개인 설정을 바꿔 주세요.")
+    if "age" in raw:
+        value = raw["age"]
+        if value in (None, ""):
+            out["age"] = None
+        elif isinstance(value, bool) or not isinstance(value, (int, float, str)):
+            raise ValidationError("나이 값이 올바르지 않아요.")
+        else:
+            try:
+                number = float(value)
+            except ValueError as exc:
+                raise ValidationError("나이에는 숫자(만 나이, 세)를 입력해 주세요.") from exc
+            if not math.isfinite(number) or number != int(number) or not 10 <= number <= 120:
+                raise ValidationError("나이는 10~120 사이의 정수(만 나이)로 입력해 주세요.")
+            out["age"] = int(number)
+    for key, allowed, label in (("sex", SEX_VALUES, "성별"), ("activity_level", ACTIVITY_VALUES, "평소 활동량"), ("special_condition", SPECIAL_VALUES, "해당되는 상황")):
+        if key in raw:
+            if raw[key] not in allowed:
+                raise ValidationError(f"{label}을(를) 다시 선택해 주세요.")
+            out[key] = raw[key]
     if "timezone" in raw:
         tz = text(raw["timezone"], 64, "시간대")
         if tz and not re.match(r"^[A-Za-z_]+(/[A-Za-z0-9_+\-]+){0,2}$", tz):
@@ -207,6 +257,10 @@ def normalize_settings(raw: dict, previous: dict, now: str) -> dict:
         out["timezone"] = tz
     if "notifications" in raw:
         out["notifications"] = bool(raw["notifications"])
+    if "rest_days" in raw:
+        out["rest_days"] = parse_rest_days(raw["rest_days"])
+        if out["rest_days"] is not None:
+            out["workouts_per_week"] = 7 - len(out["rest_days"])  # keep the count consistent with the days
     if "body" in raw:
         previous_body = {**default_body(), **(merged.get("body") or {})}
         body = normalize_body(raw["body"], previous_body)
@@ -219,13 +273,16 @@ def normalize_settings(raw: dict, previous: dict, now: str) -> dict:
 def workout_profile(settings: dict) -> dict:
     """What the AI sees for a workout routine (no account identifiers)."""
     metrics = body_metrics(settings)
+    schedule = training_schedule(settings)
     return {
         "goal": settings.get("goal_type") or None,
         "goal_note": settings.get("goal_note") or None,
         "exercise_experience": settings.get("experience") or None,
         "equipment": settings.get("equipment") or [],
         "equipment_note": settings.get("equipment_note") or None,
-        "workouts_per_week": settings.get("workouts_per_week"),
+        "workouts_per_week": len(schedule["training_days"]),
+        "training_weekdays": [WEEKDAYS[d] for d in schedule["training_days"]],
+        "rest_weekdays": [WEEKDAYS[d] for d in schedule["rest_days"]],
         "minutes_per_session": settings.get("minutes_per_session"),
         "body": {
             "height_cm": metrics["height_cm"],
@@ -252,6 +309,58 @@ def ai_profile(settings: dict) -> dict:
         "avoid_foods": settings.get("avoid_foods") or [],
         "nutrition_targets": settings.get("targets"),
     }
+
+
+# ---------------------------------------------------------------- challenges
+
+CHALLENGE_LEVELS = ["입문", "초급", "중급", "상급"]
+LEVEL_BY_EXPERIENCE = {"처음이에요": "입문", "6개월 미만": "초급", "6개월~2년": "중급", "2년 이상": "상급"}
+# Targets per level, in CHALLENGE_LEVELS order.
+CHALLENGE_TARGETS = {
+    "streak": [3, 5, 7, 14],
+    "movement_week": [2, 3, 3, 4],
+    "meals_week": [5, 7, 10, 14],
+    "body_month": [1, 2, 3, 4],
+    "days_month": [5, 8, 12, 20],
+}
+
+
+def challenge_level(experience: str, total_record_days: int) -> tuple[str, str]:
+    """Level from the exercise experience setting, or from how long the user has been recording."""
+    if experience in LEVEL_BY_EXPERIENCE:
+        return LEVEL_BY_EXPERIENCE[experience], f"운동 경험 ‘{experience}’ 기준"
+    level = "입문" if total_record_days < 7 else "초급" if total_record_days < 30 else "중급"
+    return level, f"기록한 날 {total_record_days}일 기준 (운동 경험을 설정하면 더 잘 맞춰져요)"
+
+
+def build_challenges(settings: dict, metrics: dict) -> dict:
+    """Challenges sized to the user's level. Every number comes from stored records.
+
+    metrics: total_record_days, best_streak, movement_week, meals_week, body_month, days_month, has_plan
+    """
+    level, basis = challenge_level(settings.get("experience") or "", metrics["total_record_days"])
+    i = CHALLENGE_LEVELS.index(level)
+    t = {key: values[i] for key, values in CHALLENGE_TARGETS.items()}
+    planned = settings.get("workouts_per_week")
+    move_note = "오늘의 운동을 하나 이상 완료한 날을 세요"
+    if planned:
+        t["movement_week"] = max(1, min(7, int(planned)))
+        move_note = "내 운동 요일 수 기준 · " + move_note
+
+    def item(cid, icon, title, detail, period, current, target):
+        return {"id": cid, "icon": icon, "title": title, "detail": detail, "period": period,
+                "current": min(current, target), "target": target, "done": current >= target}
+
+    items = [
+        item("streak", "✦", f"{t['streak']}일 연속 기록", "하루에 하나라도 기록하면 이어져요", "지금까지 최고", metrics["best_streak"], t["streak"]),
+        item("movement_week", "✳", f"이번 주 {t['movement_week']}번 움직이기", move_note, "이번 주", metrics["movement_week"], t["movement_week"]),
+        item("meals_week", "♡", f"이번 주 식사 {t['meals_week']}번 기록", "사진이나 이름으로 편하게", "이번 주", metrics["meals_week"], t["meals_week"]),
+        item("body_month", "▧", f"이번 달 바디 로그 {t['body_month']}번", "사진 없이 메모만 남겨도 돼요", "이번 달", metrics["body_month"], t["body_month"]),
+        item("days_month", "☼", f"이번 달 {t['days_month']}일 기록", "기록한 날을 세요", "이번 달", metrics["days_month"], t["days_month"]),
+    ]
+    if level == "입문":
+        items.insert(0, item("first_plan", "✿", "운동 루틴 추천 받아 보기", "바디 로그 탭에서 몸 상태를 입력하고 받아요", "한 번", 1 if metrics["has_plan"] else 0, 1))
+    return {"level": level, "basis": basis, "items": items, "done_count": sum(1 for x in items if x["done"]), "total": len(items)}
 
 
 # ---------------------------------------------------------------- meals
@@ -347,7 +456,7 @@ def evaluate_day(meals: list[dict], settings: dict, complete: bool) -> dict:
         messages.append({"level": "info", "text": f"분석되지 않은 기록 {agg['uncounted']}개는 합계에 포함되지 않았어요. 합계가 불완전해요."})
     if not has_targets:
         messages.append({"level": "info", "text": "영양 목표가 설정되지 않아 달성률과 부족·과다 평가는 하지 않아요."})
-        questions.append({"id": "set_targets", "text": "하루 영양 목표를 정하면 기록과 비교해 드릴 수 있어요. 지금 설정할까요?"})
+        questions.append({"id": "set_targets", "text": "개인 설정(키·몸무게·나이 등)을 입력하면 하루 영양 목표가 자동으로 계산돼 기록과 비교해 드릴 수 있어요."})
 
     if agg["counted"] == 0:
         state = "unanalyzed"

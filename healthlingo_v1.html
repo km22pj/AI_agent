@@ -564,6 +564,54 @@
     .session-card .session-meta { margin: 3px 0 8px; color: var(--muted); font-size: 11px; }
     .session-card ol { display: grid; gap: 6px; margin: 0; padding-left: 18px; font-size: 12px; line-height: 1.5; }
     .session-card ol small { display: block; color: #7b8293; font-size: 10.5px; }
+    .load-chip { display: inline-block; margin-left: 5px; padding: 1px 7px; border-radius: 999px; background: #fff1d6; color: #8e6e27; font-size: 10.5px; font-weight: 750; vertical-align: 1px; }
+    .load-chip.light { background: #f0f1f6; color: #687083; font-weight: 650; }
+    /* 오늘의 운동 목표 · 주간 편성 */
+    .today-workout { margin-top: 15px; }
+    .today-workout .tw-meta { margin: 0 0 11px; color: var(--muted); font-size: 11px; }
+    .today-workout .tw-meta strong { color: var(--ink, #2b2f3a); font-size: 13px; margin-right: 6px; }
+    .today-workout .mission-icon { font-size: 13px; font-weight: 800; color: var(--indigo-deep); }
+    .today-workout .mission-info small { display: block; margin-top: 2px; color: #8a90a0; font-size: 10px; }
+    .today-workout .mission.is-done .mission-info strong { color: #4b7158; }
+    .today-workout .mission-info .load-chip { display: inline-block; margin-top: 0; color: #8e6e27; font-size: 10px; }
+    .today-workout .mission-info .load-chip.light { color: #687083; }
+    .today-workout .tw-box { padding: 13px 14px; border: 1px solid #e5e7f4; border-radius: 14px; background: #f9f9ff; }
+    .today-workout .tw-head { display: flex; align-items: baseline; flex-wrap: wrap; gap: 6px 10px; }
+    .today-workout .tw-head strong { font-size: 13px; }
+    .today-workout .tw-head span { color: var(--muted); font-size: 11px; }
+    .today-workout ol { display: grid; gap: 5px; margin: 9px 0 0; padding-left: 18px; font-size: 12px; line-height: 1.5; }
+    .today-workout .tw-rest { padding: 16px 14px; border-radius: 14px; background: var(--sage-soft); color: #4b7158; text-align: center; }
+    .today-workout .tw-rest strong { display: block; font-size: 15px; }
+    .today-workout .tw-rest small { display: block; margin-top: 4px; font-size: 11px; color: #5f7d67; }
+    .week-plan { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 10px; margin-top: 10px; }
+    .session-card.rest { display: grid; place-items: center; min-height: 72px; border-style: dashed; background: #fbfcfa; color: #6f8a76; text-align: center; }
+    .session-card.today { border-color: var(--indigo); box-shadow: 0 0 0 2px var(--indigo-soft); }
+    .rest-chip input:checked + span { background: var(--sage-soft); border-color: #cfe0d3; color: #4b7158; }
+    /* 하루 영양 목표 (자동 계산) */
+    .nt-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; margin-top: 8px; }
+    .nt-grid .stat-card { padding: 11px 10px; }
+    .nt-grid .stat-card strong { font-size: 16px; }
+    .nt-basis { margin: 10px 0 0; padding: 0 0 0 18px; color: #5d6476; font-size: 11.5px; line-height: 1.7; }
+    .nt-rows { display: grid; gap: 7px; }
+    .nt-row { display: grid; grid-template-columns: 52px 1fr auto; gap: 8px; align-items: center; font-size: 11.5px; }
+    .nt-row .challenge-bar { margin: 0; }
+    .nt-row b { font-weight: 700; color: var(--indigo-deep); }
+    .nt-history { margin: 8px 0 0; padding-left: 18px; color: var(--muted); font-size: 11px; line-height: 1.7; }
+    @media (max-width: 760px) { .nt-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+    /* 수준별 도전과제 (내 기록 탭) */
+    .challenge-head { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin-top: 18px; }
+    .challenge-head .sub-title { margin: 0; }
+    .challenge-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 9px; margin-top: 10px; }
+    .challenge { display: grid; grid-template-columns: 38px 1fr; gap: 10px; align-items: center; padding: 12px; border: 1px solid #ededea; border-radius: 14px; background: #fdfdfb; }
+    .challenge .badge-icon { width: 38px; height: 38px; margin: 0; border-radius: 12px; font-size: 16px; }
+    .challenge strong { display: block; font-size: 12px; }
+    .challenge small { display: block; margin-top: 2px; color: var(--muted); font-size: 10px; }
+    .challenge-bar { height: 6px; margin-top: 7px; overflow: hidden; border-radius: 99px; background: #eeeff5; }
+    .challenge-bar span { display: block; height: 100%; border-radius: inherit; background: var(--indigo); }
+    .challenge-count { margin-top: 4px; color: var(--indigo-deep); font-size: 10px; font-weight: 750; }
+    .challenge.done { border-color: #dce9de; background: var(--sage-soft); }
+    .challenge.done .challenge-bar span { background: #6f9a7b; }
+    .challenge.done .challenge-count { color: #4b7158; }
     @media (max-width: 760px) { .body-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
   </style>
 </head>
@@ -666,27 +714,11 @@
 
               <section class="surface mission-card" aria-labelledby="mission-title">
                 <div class="section-head">
-                  <div><h2 class="section-title" id="mission-title">오늘의 작은 목표</h2><p class="section-subtitle">다 하지 않아도 괜찮아요</p></div>
-                  <span class="progress-count"><span id="completed-count">0</span> / 3 완료</span>
+                  <div><h2 class="section-title" id="mission-title">오늘의 운동 목표</h2><p class="section-subtitle">다 하지 않아도 괜찮아요</p></div>
+                  <span class="progress-count" id="goal-progress-count" hidden><span id="completed-count">0</span> / <span id="total-count">0</span> 완료 · <span id="goal-pct">0%</span></span>
                 </div>
-                <div class="progress-track" role="progressbar" aria-label="오늘의 목표 진행률" aria-valuemin="0" aria-valuemax="3" aria-valuenow="0"><div class="progress-fill"></div></div>
-                <div class="mission-list" style="margin-top:17px">
-                  <article class="mission" data-mission="warmup">
-                    <span class="mission-icon" aria-hidden="true">☀</span>
-                    <span class="mission-info"><strong>가볍게 몸 풀기</strong><span>5분 · 나를 깨우는 시간</span></span>
-                    <button class="mission-action" type="button">완료하기</button>
-                  </article>
-                  <article class="mission" data-mission="movement">
-                    <span class="mission-icon" aria-hidden="true">✳</span>
-                    <span class="mission-info"><strong>나에게 맞는 움직임</strong><span id="movement-detail">15분 · 편안한 강도</span></span>
-                    <button class="mission-action" type="button">완료하기</button>
-                  </article>
-                  <article class="mission" data-mission="record">
-                    <span class="mission-icon" aria-hidden="true">♡</span>
-                    <span class="mission-info"><strong>오늘의 식사 또는 컨디션</strong><span>식사나 바디로그를 저장하면 완료돼요</span></span>
-                    <button class="mission-action" type="button">기록하기</button>
-                  </article>
-                </div>
+                <div class="progress-track" id="goal-progress" role="progressbar" aria-label="오늘의 운동 진행률" aria-valuemin="0" aria-valuemax="0" aria-valuenow="0" hidden><div class="progress-fill"></div></div>
+                <div class="today-workout" id="today-workout" aria-live="polite"></div>
               </section>
             </div>
 
@@ -694,6 +726,10 @@
               <section class="surface rhythm-card">
                 <div class="ring" id="today-ring" aria-label="오늘 목표 진행"><span id="ring-count">0/3</span></div>
                 <div class="rhythm-copy"><strong id="rhythm-title">나만의 속도로 좋아요</strong><p id="rhythm-copy">오늘의 작은 목표를<br>하나씩 채워 봐요.</p></div>
+              </section>
+              <section class="surface panel today-nutrition" aria-labelledby="today-nutrition-title">
+                <div class="section-head" style="margin-bottom:8px"><div><h2 class="section-title" id="today-nutrition-title">오늘의 영양 목표</h2><p class="section-subtitle" id="today-nutrition-sub">개인 설정 기반 추정치</p></div></div>
+                <div id="today-nutrition"></div>
               </section>
               <section class="surface streak-card" aria-labelledby="streak-title">
                 <div class="streak-count" aria-hidden="true"><div><strong id="streak-days">–</strong><small>일 연속</small></div></div>
@@ -848,7 +884,7 @@
             <span class="tag sage" style="margin-left:auto" id="profile-account-tag">Google 계정</span>
           </section>
           <div class="stats-grid">
-            <div class="stat-card"><span>이번 달 운동 기록</span><strong id="stat-movement">–</strong><small>‘나에게 맞는 움직임’ 완료</small></div>
+            <div class="stat-card"><span>이번 달 운동 기록</span><strong id="stat-movement">–</strong><small>루틴 운동을 하나 이상 완료한 날</small></div>
             <div class="stat-card"><span>이번 달 식사 기록</span><strong id="stat-meals">–</strong><small>편한 방식으로 기록</small></div>
             <div class="stat-card"><span>이번 달 바디 로그</span><strong id="stat-body">–</strong><small>사진은 선택 사항</small></div>
             <div class="stat-card"><span>이번 달 기록한 날</span><strong id="stat-days">–</strong><small>하나라도 기록한 날</small></div>
@@ -860,6 +896,20 @@
               <div class="badge-card locked" data-badge="restart"><span class="badge-icon">↻</span><strong>다시 시작</strong><span>쉬었다가 다시 기록했어요</span></div>
               <div class="badge-card locked" data-badge="routine"><span class="badge-icon">☼</span><strong>나만의 루틴</strong><span>한 주에 3일 이상 기록했어요</span></div>
             </div>
+            <div class="challenge-head">
+              <p class="sub-title">내 수준에 맞춘 도전과제</p>
+              <span class="tag indigo" id="challenge-level">–</span>
+              <span class="tag sage" id="challenge-progress"></span>
+              <button class="text-button" type="button" data-action="open-settings" style="margin-left:auto">운동 경험 바꾸기</button>
+            </div>
+            <p class="hint" id="challenge-basis" style="margin:4px 0 0">기록을 불러오는 중이에요…</p>
+            <div class="challenge-list" id="challenge-list"></div>
+            <div hidden>
+            </div>
+          </section>
+          <section class="surface panel" style="margin-top:17px" aria-labelledby="nutrition-title">
+            <div class="section-head"><div><h2 class="section-title" id="nutrition-title">하루 영양 목표</h2><p class="section-subtitle">개인 설정으로 자동 계산한 값이에요. 홈·식사 코치의 달성률이 이 값을 써요.</p></div><button class="text-button" type="button" data-action="edit-nutrition">개인 설정 수정</button></div>
+            <div id="nutrition-panel"></div>
           </section>
           <section class="surface panel" style="margin-top:17px">
             <div class="section-head"><div><h2 class="section-title">개인 설정</h2><p class="section-subtitle">피드백과 추천에 쓰여요</p></div><button class="text-button" type="button" data-action="open-settings">수정하기</button></div>
@@ -978,14 +1028,31 @@
             <div class="field"><label for="set-muscle">골격근량 (kg)</label><input type="number" id="set-muscle" min="5" max="90" step="0.1" inputmode="decimal" placeholder="예: 22.4"></div>
           </div>
           <input type="text" id="set-condition" maxlength="200" placeholder="운동할 때 주의할 점 (선택, 예: 무릎 통증, 허리 디스크)" style="margin-top:6px;min-height:38px;padding:8px 11px;border:1px solid var(--line);border-radius:11px">
+          <p class="hint" style="margin-top:10px">아래 4가지는 하루 영양 목표 자동 계산에만 쓰여요.</p>
+          <div class="field-row" style="margin-top:6px">
+            <div class="field"><label for="set-age">나이 (만 나이)</label><input type="number" id="set-age" min="10" max="120" step="1" inputmode="numeric" placeholder="예: 30"></div>
+            <div class="field"><label for="set-sex">성별 (계산식용)</label>
+              <select id="set-sex"><option value="">선택 안 함</option><option value="female">여성</option><option value="male">남성</option></select></div>
+          </div>
+          <div class="field-row" style="margin-top:6px">
+            <div class="field"><label for="set-activity">평소 활동량 (운동 제외)</label>
+              <select id="set-activity"><option value="">선택 안 함</option><option value="sedentary">주로 앉아서 지내요</option><option value="light">가볍게 자주 움직여요 (서서 일하기·걷기 많음)</option><option value="active">몸을 많이 쓰는 일을 해요</option></select></div>
+            <div class="field"><label for="set-special">해당되는 상황</label>
+              <select id="set-special"><option value="">선택 안 함</option><option value="none">해당 없음</option><option value="pregnant">임신 또는 수유 중</option><option value="medical">의료진의 식이 관리를 받는 중</option></select></div>
+          </div>
+          <p class="hint" style="margin-top:4px">성별은 계산식(Mifflin-St Jeor)의 상수 때문에 필요해요. 운동은 휴식 요일·1회 운동 시간으로 따로 계산하니, 평소 활동량에는 운동을 빼고 골라 주세요.</p>
         </div>
         <div class="field">
           <span class="label">사용 가능한 장비</span>
           <div class="chip-group" id="set-equipment"></div>
           <input type="text" id="set-equipment-note" maxlength="120" placeholder="기타 장비 (선택)" style="margin-top:6px;min-height:38px;padding:8px 11px;border:1px solid var(--line);border-radius:11px">
         </div>
+        <div class="field" id="set-rest-section">
+          <span class="label">휴식 요일</span>
+          <div class="chip-group" id="set-rest-days" role="group" aria-label="휴식 요일 선택"></div>
+          <p class="hint" id="set-rest-hint" style="margin-top:6px"></p>
+        </div>
         <div class="field-row">
-          <div class="field"><label for="set-per-week">주당 운동 횟수</label><input type="number" id="set-per-week" min="0" max="14" step="1" placeholder="예: 3"></div>
           <div class="field"><label for="set-minutes">1회 가능한 시간 (분)</label><input type="number" id="set-minutes" min="5" max="240" step="5" placeholder="예: 30"></div>
         </div>
         <div class="field"><label for="set-pref">식사 선호 (선택)</label><input type="text" id="set-pref" maxlength="300" placeholder="예: 한식 위주, 매운 음식 좋아함, 채식 지향"></div>
@@ -994,14 +1061,9 @@
           <div class="field"><label for="set-avoid">피하고 싶은 음식</label><input type="text" id="set-avoid" placeholder="쉼표로 구분 (예: 오이, 튀김)"></div>
         </div>
         <div class="field">
-          <span class="label">하루 영양 목표</span>
-          <p class="hint">직접 정했거나 전문가와 확인한 값만 입력하세요. 비워 두면 달성률을 계산하지 않아요. 열량 목표는 1,000kcal 이상으로만 설정할 수 있어요.</p>
-          <div class="field-row" style="margin-top:6px">
-            <div class="field"><label for="set-kcal">열량 (kcal)</label><input type="number" id="set-kcal" min="1000" max="6000" step="10"></div>
-            <div class="field"><label for="set-carbs">탄수화물 (g)</label><input type="number" id="set-carbs" min="20" max="900" step="1"></div>
-            <div class="field"><label for="set-protein">단백질 (g)</label><input type="number" id="set-protein" min="20" max="400" step="1"></div>
-            <div class="field"><label for="set-fat">지방 (g)</label><input type="number" id="set-fat" min="10" max="300" step="1"></div>
-          </div>
+          <span class="label">하루 영양 목표 <span class="tag indigo" style="margin-left:4px">자동 계산</span></span>
+          <div id="set-nutrition-card"></div>
+          <p class="hint" style="margin-top:6px">직접 입력하지 않아요. 위 개인 설정을 저장하면 공개된 계산식으로 자동 계산돼요. 과거 날짜의 목표는 바뀌지 않아요.</p>
         </div>
         <p class="hint" id="set-timezone"></p>
       </div>

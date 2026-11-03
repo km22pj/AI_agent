@@ -100,6 +100,31 @@ CREATE TABLE IF NOT EXISTS day_meta (
     PRIMARY KEY (user_id, date)
 );
 
+-- Daily nutrition targets, as a history. A day uses the latest row whose effective_date is on or
+-- before it, so a new target never changes past days. status: ok | missing | unsupported (no numbers).
+-- source: auto (calculated from settings) | legacy (targets typed in by hand before auto calculation).
+CREATE TABLE IF NOT EXISTS nutrition_targets (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    effective_date TEXT NOT NULL,
+    status TEXT NOT NULL,
+    source TEXT NOT NULL,
+    kcal REAL, carbs_g REAL, protein_g REAL, fat_g REAL,
+    inputs TEXT, basis TEXT, input_hash TEXT, message TEXT,
+    explanation TEXT, explanation_status TEXT NOT NULL DEFAULT 'none',
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_nutrition_targets_user_date ON nutrition_targets (user_id, effective_date, id);
+
+-- Exercises of the day's routine that the user marked done (item = "<index>:<name>").
+CREATE TABLE IF NOT EXISTS exercise_checks (
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    date TEXT NOT NULL,
+    item TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (user_id, date, item)
+);
+
 -- The latest AI workout routine per user. input_hash detects when body values or settings changed.
 CREATE TABLE IF NOT EXISTS workout_plans (
     user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
