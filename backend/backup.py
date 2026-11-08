@@ -14,8 +14,8 @@ import time
 from pathlib import Path
 
 DB_NAME = "healthlingo.db"
-CODE_FILES = ["run.py", "app.js", "healthlingo_v1.html", "requirements.txt", "README.md", ".env.example"]
-CODE_DIRS = ["backend", "deploy"]
+CODE_FILES = ["run.py", "app.js", "healthlingo_v1.html", "manifest.webmanifest", "sw.js", "requirements.txt", "README.md", "NUTRITION.md", ".env.example"]
+CODE_DIRS = ["backend", "deploy", "icons"]
 BUNDLE_PREFIX = "healthlingo/"
 
 

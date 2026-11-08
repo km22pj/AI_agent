@@ -459,6 +459,10 @@
     state.nutrition = null;
     state.explaining = false;
     state.explainError = null;
+    state.feedbackDraft = null;
+    if (reviewTimer) { clearTimeout(reviewTimer); reviewTimer = null; }
+    $("#today-review").replaceChildren();
+    $("#today-feedback").replaceChildren();
     state.mealForm = null;
     state.bodyForm = null;
     state.analyzing = new Set();
@@ -640,6 +644,7 @@
       $("#rhythm-copy").textContent = "바디 로그에서 운동 루틴을 받으면 오늘 할 운동이 보여요.";
     }
 
+    renderTodayExtras(tw);
     if (!tw) { box.replaceChildren(); return; }
     const dayLabel = `${WEEKDAYS[tw.weekday]}요일`;
     if (tw.status === "rest") {
@@ -668,8 +673,101 @@
             ex.tip ? h("small", { text: ex.tip }) : null),
           button);
       })),
-      tw.stale ? h("p", { class: "hint", style: "margin:10px 0 0", text: "루틴을 받은 뒤 몸 상태나 휴식 요일이 바뀌었어요. 바디 로그에서 다시 받을 수 있어요." }) : null,
+      tw.stale && tw.review && tw.review.status !== "running" ? h("p", { class: "hint", style: "margin:10px 0 0", text: "몸 상태나 운동 설정이 바뀌었는데 아직 루틴에 반영되지 않았어요. 바디 로그에서 루틴을 다시 받을 수 있어요." }) : null,
     ].filter(Boolean)); // replaceChildren would print a null as the text "null"
+  }
+
+  // ------------------------------------------------------------------ workout feedback + automatic AI review
+  const FEEDBACK_PRESETS = ["너무 쉬웠어요", "힘들어서 못 했어요", "약속 때문에 쉬었어요", "내일은 20분만 가능해요"];
+  const DECISION_TEXT = { keep: "계획 유지", increase: "강도·양 늘림", decrease: "강도·양 줄임", reschedule: "일정 변경", mixed: "일부 조정" };
+  const TRIGGER_TEXT = { feedback: "피드백 저장", settings: "개인 설정 변경", new_week: "새 주 준비" };
+
+  function adjustmentBox(adj) {
+    if (!adj) return null;
+    const list = (items) => h("ul", null, (items || []).map((t) => h("li", { text: t })));
+    if (adj.source === "agent") {
+      const days = (adj.changed_days || []).map((d) => WEEKDAYS[d]).join("·");
+      return h("div", { class: "notice info adj-box", style: "margin-top:10px" },
+        h("strong", { text: `AI 자동 조정 · ${DECISION_TEXT[adj.decision] || adj.decision} · ${days ? `바뀐 요일 ${days}` : "바뀐 요일 없음"}` }),
+        list(adj.summary),
+        h("p", { class: "hint", style: "margin:6px 0 0", text: `${TRIGGER_TEXT[adj.trigger] || "자동"} 후 ${fmtStamp(adj.at)} 반영 · 지난 요일과 이미 완료한 운동은 바꾸지 않아요.` }));
+    }
+    if (adj.source === "regenerate") return h("div", { class: "notice info adj-box", style: "margin-top:10px" }, h("strong", { text: `루틴 다시 받기 · ${fmtStamp(adj.at)}` }), list(adj.summary));
+    if (adj.rate != null) return h("div", { class: "notice info", style: "margin-top:10px" }, `지난주 달성률 ${Math.round(adj.rate * 100)}% (${adj.planned}개 중 ${adj.done}개 완료)를 반영했던 이전 방식의 조정이에요.`);
+    return null;
+  }
+
+  function reviewNotice(review) {
+    if (!review) return null;
+    if (review.status === "running") {
+      return h("div", { class: "notice info", style: "margin-top:10px" }, spinner(), ` AI가 최신 정보와 기록으로 ${review.trigger === "new_week" ? "이번 주 루틴을 준비" : "남은 루틴을 점검"}하고 있어요…`);
+    }
+    if (review.status === "failed") return h("div", { class: "notice", style: "margin-top:10px" }, h("strong", { text: "자동 조정 실패 · " }), review.message);
+    if (review.status === "up_to_date") return h("p", { class: "hint", style: "margin:10px 0 0", text: review.message });
+    return null;
+  }
+
+  // While the AI review runs (in the background on the server), refresh every few seconds.
+  let reviewTimer = null;
+  let reviewPolls = 0;
+  function watchReview(...reviews) {
+    if (!reviews.some((r) => r && r.status === "running")) { reviewPolls = 0; return; }
+    if (reviewTimer || reviewPolls >= 60) return;
+    const epoch = state.epoch;
+    reviewTimer = setTimeout(() => {
+      reviewTimer = null;
+      reviewPolls += 1;
+      if (epoch !== state.epoch) return;
+      loadOverview();
+      if ($("#screen-body").classList.contains("active")) loadWorkout();
+    }, 3000);
+  }
+
+  function renderTodayExtras(tw) {
+    const reviewBox = $("#today-review");
+    const fbBox = $("#today-feedback");
+    const hasPlan = Boolean(tw && tw.status !== "no_plan" && tw.review && tw.review.status !== "none");
+    if (!hasPlan) { reviewBox.replaceChildren(); fbBox.replaceChildren(); return; }
+    const latest = tw.latest_adjustment;
+    fill(reviewBox, reviewNotice(tw.review), tw.review.status !== "running" ? adjustmentBox(latest) : null);
+    watchReview(tw.review);
+    const area = $("#workout-feedback");
+    if (area && document.activeElement === area) return; // don't wipe what the user is typing
+    fbBox.replaceChildren(feedbackBox(tw));
+  }
+
+  function feedbackBox(tw) {
+    const saved = tw.feedback && tw.feedback.date === todayStr() ? tw.feedback : null;
+    const area = h("textarea", { id: "workout-feedback", maxlength: "200", rows: "2", "aria-label": "오늘 운동 피드백",
+      placeholder: "선택 사항이에요. 비워 두고 저장하면 ‘피드백 없음’으로 기록돼요.",
+      oninput: (e) => { state.feedbackDraft = e.currentTarget.value; } });
+    area.value = state.feedbackDraft != null ? state.feedbackDraft : saved ? saved.text : "";
+    const chips = FEEDBACK_PRESETS.map((t) => btn(t, "mini-button", () => { area.value = t; state.feedbackDraft = t; area.focus(); }));
+    const save = btn("피드백 저장", "secondary-button small-button", () => saveFeedback(area.value, save));
+    return h("div", { class: "tw-feedback" },
+      h("label", { class: "tw-feedback-title", for: "workout-feedback", text: "오늘 운동은 어떠셨나요? (선택)" }),
+      h("div", { class: "chip-row" }, chips),
+      area,
+      h("div", { class: "tw-feedback-foot" }, save,
+        h("span", { class: "hint", text: saved ? `저장됨 · ${saved.label} · ${fmtStamp(saved.updated_at)}` : "입력하지 않아도 모든 기능을 그대로 쓸 수 있어요." })));
+  }
+
+  async function saveFeedback(value, button) {
+    const epoch = state.epoch;
+    await withBusy(button, "저장 중", async () => {
+      try {
+        const res = await api("/api/workout-feedback", { method: "PUT", body: { date: todayStr(), text: value.trim() } });
+        if (epoch !== state.epoch) return;
+        state.feedbackDraft = null;
+        $("#today-feedback").replaceChildren(); // re-rendered below with the saved value
+        notify(!res.changed ? "같은 피드백이 이미 저장돼 있어요." : res.review_started ? "피드백을 저장했어요. AI가 남은 루틴을 점검해요." : "피드백을 저장했어요.");
+      } catch (error) {
+        notify(error.message);
+      }
+    });
+    if (epoch !== state.epoch) return;
+    loadOverview();
+    if ($("#screen-body").classList.contains("active")) loadWorkout();
   }
 
   async function toggleExercise(ex, done, button) {
@@ -957,7 +1055,9 @@
         state.nutrition = res.nutrition;
         closeDialog($("#settings-dialog"));
         renderProfile();
-        notify(res.nutrition_changed ? (res.nutrition.current ? "개인 설정을 저장하고 하루 영양 목표를 다시 계산했어요." : "개인 설정을 저장했어요. 영양 목표는 필요한 정보가 있어야 계산돼요.") : "개인 설정을 저장했어요.");
+        notify((res.nutrition_changed ? (res.nutrition.current ? "개인 설정을 저장하고 하루 영양 목표를 다시 계산했어요." : "개인 설정을 저장했어요. 영양 목표는 필요한 정보가 있어야 계산돼요.") : "개인 설정을 저장했어요.")
+          + (res.routine_review_started ? " AI가 바뀐 정보로 운동 루틴도 점검해요." : ""));
+        if (res.routine_review_started) loadWorkout();
         if (res.nutrition_changed && res.nutrition.current && res.nutrition.current.source === "auto") requestExplanation();
         if (state.food.date && $("#screen-food").classList.contains("active")) loadFoodDay({ keep: true });
         if ($("#screen-body").classList.contains("active")) loadWorkout();
@@ -2200,22 +2300,26 @@
       return;
     }
     if (plan) {
-      if (plan.stale) kids.push(h("div", { class: "notice", style: "margin-top:8px" }, "이 루틴을 받은 뒤 몸 상태나 운동 설정이 바뀌었어요. 다시 받으면 최신 값이 반영돼요."));
-      const adj = (plan.adjustments || [])[0];
-      if (adj) {
-        const LEVEL = { decrease: "강도를 낮췄어요", increase: "강도와 양을 늘렸어요", keep: "지금 강도를 유지해요" };
-        kids.push(h("div", { class: `notice${adj.level === "keep" ? " info" : ""}`, style: "margin-top:8px" },
-          h("strong", { text: `지난주 운동 달성률 ${Math.round(adj.rate * 100)}% (${adj.planned}개 중 ${adj.done}개 완료) → ${LEVEL[adj.level]}` }),
-          adj.changes && adj.changes.length ? h("ul", { style: "margin:6px 0 0;padding-left:18px;font-size:11.5px" }, adj.changes.map((c) => h("li", { text: c }))) : null,
-          h("p", { class: "hint", style: "margin:6px 0 0", text: `${fmtDate(adj.applied_week)} 주에 ${adj.source === "ai" ? "새 루틴을 받으며" : "자동으로"} 반영했어요. 기준: 절반 미만 완료 → 낮춤, 모두 완료 → 늘림 (앱 규칙). 중량 증가는 ACSM 권고(2~10%) 안에서만 해요.` })));
-      } else {
-        kids.push(h("p", { class: "hint", style: "margin-top:8px", text: "매주 월요일, 지난주 ‘오늘의 운동 목표’ 완료율을 보고 루틴 강도를 자동으로 조정해요 (절반 미만 → 낮춤, 모두 완료 → 늘림)." }));
+      const review = w.data.review;
+      if (plan.stale && review.status !== "running") kids.push(h("div", { class: "notice", style: "margin-top:8px" }, "몸 상태나 운동 설정이 바뀌었는데 아직 루틴에 반영되지 않았어요. ‘루틴 다시 받기’로 새로 받을 수도 있어요."));
+      const notice = reviewNotice(review);
+      if (notice) kids.push(notice);
+      const adj = review.status !== "running" ? adjustmentBox((plan.adjustments || [])[0]) : null;
+      if (adj) kids.push(adj);
+      kids.push(h("p", { class: "hint", style: "margin-top:8px", text: "오늘 운동 피드백을 저장하거나 몸 상태·운동 설정을 바꾸면, AI가 기록을 확인해 오늘 남은 운동부터 일요일까지 필요한 부분만 자동으로 조정해요. 다음 주 루틴은 이번 주 운동을 마치거나 새 주에 처음 들어오면 자동으로 준비돼요." }));
+      if (w.data.next_week && w.data.next_week.ready) {
+        kids.push(h("p", { class: "hint", style: "margin-top:4px", text: w.data.next_week.review.status === "running" ? "다음 주 루틴을 AI가 준비하고 있어요…" : `다음 주(${fmtDate(w.data.next_week.week_start)}~) 루틴도 준비됐어요.` }));
       }
+      watchReview(review, w.data.next_week && w.data.next_week.review);
       if (plan.summary) kids.push(h("p", { style: "margin:10px 0 0;font-size:13px;line-height:1.65", text: plan.summary }));
       const todayIdx = todayWeekday();
       const sessionCard = (s) => h("div", { class: `session-card${s.weekday === todayIdx ? " today" : ""}` },
         h("h4", null, s.weekday != null ? `${WEEKDAYS[s.weekday]}요일 · ${s.title}` : s.title, s.weekday === todayIdx ? h("span", { class: "tag indigo", style: "margin-left:6px", text: "오늘" }) : null),
         h("p", { class: "session-meta", text: [s.focus, `${s.minutes}분`, s.intensity].filter(Boolean).join(" · ") }),
+        (() => { // what was done on days that have started (kept as-is by every adjustment)
+          const p = plan.progress && plan.progress[String(s.weekday)];
+          return p && s.weekday <= todayIdx ? h("p", { class: "done-line", text: `완료 ${p.done}/${p.planned}` }) : null;
+        })(),
         exerciseList(s.exercises),
       );
       if ((plan.format || 1) >= 3) {
@@ -2288,6 +2392,8 @@
     else if (action === "edit-body") openSettings({ focus: "#set-height" });
     else if (action === "edit-rest") openRestDays();
     else if (action === "edit-nutrition") openNutritionSettings();
+    else if (action === "install-app") installApp();
+    else if (action === "dismiss-install") { try { localStorage.setItem(INSTALL_DISMISSED, "1"); } catch { /* private mode */ } renderInstall(); }
     else if (action === "add-meal") openMealForm({ date: state.food.date || todayStr() });
     else if (action === "add-meal-today") goToFood(todayStr(), true);
     else if (action === "body-new-photo") openBodyForm({ date: todayStr(), pickPhoto: true });
@@ -2306,10 +2412,71 @@
   $("#badge-info").addEventListener("click", () => notify("배지는 저장된 기록으로 자동으로 열려요: 첫 기록, 4일 이상 쉬었다가 다시 기록, 한 주에 3일 이상 기록. 도전과제는 운동 경험(입문·초급·중급·상급)에 맞춰 목표가 달라지고, 주간 과제는 매주 월요일, 월간 과제는 매월 1일에 새로 시작해요."));
   $("#privacy-info").addEventListener("click", () => notify(`기록과 사진은 이 서버에 내 계정으로만 저장돼요. AI 분석을 요청할 때만 사진과 식사 정보가 AI 서비스(${(state.config && state.config.ai_provider_name) || "AI 서비스"})로 전송돼요.`));
 
+  // ------------------------------------------------------------------ installable app (PWA)
+  const isStandalone = () => window.matchMedia("(display-mode: standalone)").matches || window.navigator.standalone === true;
+  const isIOS = () => /iphone|ipad|ipod/i.test(navigator.userAgent) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+  let installPrompt = null; // Android/Chrome hand this over when the app can be installed
+  const INSTALL_DISMISSED = "hl-install-dismissed";
+  const installDismissed = () => { try { return localStorage.getItem(INSTALL_DISMISSED) === "1"; } catch { return false; } };
+
+  if ("serviceWorker" in navigator && window.isSecureContext) {
+    window.addEventListener("load", () => { navigator.serviceWorker.register("/sw.js").catch(() => { /* app still works without it */ }); });
+  }
+  window.addEventListener("beforeinstallprompt", (event) => { event.preventDefault(); installPrompt = event; renderInstall(); });
+  window.addEventListener("appinstalled", () => { installPrompt = null; notify("Healthlingo 앱을 설치했어요. 홈 화면에서 열 수 있어요."); renderInstall(); });
+
+  async function installApp() {
+    if (installPrompt) {
+      const prompt = installPrompt;
+      installPrompt = null;
+      prompt.prompt();
+      try { await prompt.userChoice; } catch { /* closed */ }
+      renderInstall();
+      return;
+    }
+    showScreen("profile");
+    $("#install-panel").scrollIntoView({ behavior: "smooth", block: "center" });
+  }
+
+  function renderInstall() {
+    const panel = $("#install-panel");
+    const standalone = isStandalone();
+    $("#install-banner").hidden = standalone || installDismissed() || !(installPrompt || isIOS());
+    $("#install-banner-text").textContent = isIOS() && !installPrompt ? "Safari의 공유 버튼 → ‘홈 화면에 추가’로 설치할 수 있어요." : "홈 화면에 추가하면 앱처럼 바로 열 수 있어요.";
+    if (standalone) {
+      panel.replaceChildren(h("div", { class: "notice info" }, "지금 설치된 앱으로 실행 중이에요. ✓ 기록·사진·AI 분석은 웹과 똑같이 서버에 저장돼요."));
+      return;
+    }
+    if (installPrompt) {
+      panel.replaceChildren(h("p", { class: "hint", style: "margin:0", text: "이 기기에 바로 설치할 수 있어요. 설치하면 홈 화면 아이콘으로 열리고 주소창 없이 전체 화면으로 보여요." }),
+        btn("앱 설치하기", "primary-button small-button", installApp, { style: "margin-top:10px" }));
+      return;
+    }
+    const steps = isIOS()
+      ? ["Safari로 이 사이트를 열어요 (다른 앱 안의 브라우저에서는 안 돼요)", "아래쪽 <b>공유 버튼</b>(네모에 위쪽 화살표)을 눌러요", "<b>홈 화면에 추가</b> → <b>추가</b>를 눌러요", "홈 화면의 Healthlingo 아이콘으로 열어요. 처음 한 번은 초대 링크를 붙여 넣으라는 화면이 나올 수 있어요 (아이폰 앱은 Safari와 로그인 정보를 따로 보관해요)"]
+      : ["Chrome 또는 삼성 인터넷으로 이 사이트를 열어요", "오른쪽 위(또는 아래) <b>메뉴(⋮ / ≡)</b>를 눌러요", "<b>앱 설치</b> 또는 <b>홈 화면에 추가</b>를 눌러요", "홈 화면의 Healthlingo 아이콘으로 열어요"];
+    const list = h("ol", { class: "install-steps" });
+    list.innerHTML = steps.map((s) => `<li>${s}</li>`).join(""); // fixed text above, no user input
+    panel.replaceChildren(h("p", { class: "hint", style: "margin:0", text: isIOS() ? "아이폰·아이패드는 Safari에서 이렇게 설치해요." : "휴대폰에서 이렇게 설치해요. (PC에서는 Chrome 주소창 오른쪽의 설치 아이콘을 눌러도 돼요)" }), list);
+  }
+
+  // Offline notice: records live on the server, so nothing can be loaded or saved without a connection.
+  function renderOnline() { $("#offline-banner").hidden = navigator.onLine !== false; }
+  window.addEventListener("offline", renderOnline);
+  window.addEventListener("online", () => {
+    renderOnline();
+    if (!state.user) return;
+    notify("다시 연결됐어요.");
+    const active = $(".screen.active");
+    if (active) showScreen(active.id.replace("screen-", ""));
+  });
+
   // ------------------------------------------------------------------ boot
   async function boot() {
     renderTodayGoal(null);
     resetComparePreview();
+    renderInstall();
+    renderOnline();
     try {
       state.config = await api("/api/config");
     } catch (error) {

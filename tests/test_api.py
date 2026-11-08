@@ -48,6 +48,18 @@ def b64(data: bytes) -> str:
     return base64.b64encode(data).decode("ascii")
 
 
+def agent_reply(action="submit", decision="keep", changes=None, summary=None, feedback_ids=None, records=False, notes=None, weeks=1):
+    """One reply of the routine review loop, in the AI's JSON shape."""
+    return {"action": action, "history_weeks": weeks, "decision": decision, "based_on_feedback_ids": feedback_ids or [],
+            "based_on_records": records, "changes": changes or [], "feedback_notes": notes or [], "summary": summary or []}
+
+
+def agent_session(weekday, title="전신", minutes=30, intensity="가볍게", exercises=None):
+    return {"weekday": weekday, "title": title, "focus": "전신", "minutes": minutes, "intensity": intensity,
+            "exercises": exercises or [{"name": "제자리 걷기", "amount": "5분", "weight_kg": 0, "weight_note": "맨몸", "tip": ""},
+                                       {"name": "스트레칭", "amount": "5분", "weight_kg": 0, "weight_note": "", "tip": ""}]}
+
+
 class FakeAIClient:
     """Mimics AnthropicJSONClient.complete_json with deterministic answers."""
 
@@ -56,6 +68,8 @@ class FakeAIClient:
         self.calls = 0
         self.coach_recs = None
         self.workout_extra_day = False  # True: also return a session on Sunday (should be dropped if it's a rest day)
+        self.agent_script = None  # routine review: list of replies (in order) or a function(context, steps) -> reply
+        self.agent_calls: list[dict] = []
 
     def complete_json(self, system, content, schema, task=None):
         self.calls += 1
@@ -90,6 +104,15 @@ class FakeAIClient:
                 {"food": "고등어구이", "reason": "단백질과 지방이 있어요.", "ingredients": ["고등어"]},
             ]
             return {"summary": "지금까지 기록 기준이에요.", "observations": ["단백질 기록이 있어요."], "recommendations": recs, "questions": ["저녁은 드셨나요?"]}
+        if "routine adjustment agent" in system:
+            context = json.loads(content[0]["text"].split("\n", 1)[1])
+            steps = [c["text"] for c in content[1:]]
+            self.agent_calls.append({"context": context, "steps": steps})
+            if callable(self.agent_script):
+                return self.agent_script(context, steps)
+            if self.agent_script:
+                return self.agent_script.pop(0)
+            return agent_reply("submit", summary=["기록과 설정을 확인했고 지금 계획을 유지해요."])
         if "ALREADY calculated" in system:
             payload = json.loads(content[0]["text"].split("\n", 1)[1])
             kcal = int(payload["targets"]["kcal"])
@@ -285,6 +308,7 @@ class ServerTestCase(unittest.TestCase):
         settings = Settings(host="127.0.0.1", port=0, data_dir=self.tmp, google_client_id=CLIENT_ID, dev_login=True, ai_model="fake-model", **options)
         ai = AIService(self.fake if self.ai_enabled else None)
         self.server = make_server(settings, ai=ai, key_store=auth.GoogleKeyStore(fetcher=jwks_fetcher))
+        self.server.app.run_jobs_inline = True  # the AI routine review runs inside the request in tests
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
         self.base = f"http://127.0.0.1:{self.server.server_address[1]}"
