@@ -19,8 +19,8 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 from . import auth
-from .ai import AIError, AINotConfigured, AIService, build_ai_service
-from . import progression
+from .ai import INTENSITIES, WEEKDAY_NAMES, AIError, AINotConfigured, AIService, build_ai_service
+from . import progression, routine_agent
 from .nutrition import SOURCES as NUTRITION_SOURCES
 from .nutrition import compute_targets
 from .config import PROJECT_ROOT, Settings, parse_emails, read_env_value
@@ -62,7 +62,19 @@ STATIC_FILES = {
     "/": ("healthlingo_v1.html", "text/html; charset=utf-8"),
     "/index.html": ("healthlingo_v1.html", "text/html; charset=utf-8"),
     "/app.js": ("app.js", "text/javascript; charset=utf-8"),
+    # Installable app (PWA)
+    "/manifest.webmanifest": ("manifest.webmanifest", "application/manifest+json; charset=utf-8"),
+    "/sw.js": ("sw.js", "text/javascript; charset=utf-8"),
+    "/icons/icon-192.png": ("icons/icon-192.png", "image/png"),
+    "/icons/icon-512.png": ("icons/icon-512.png", "image/png"),
+    "/icons/icon-maskable-512.png": ("icons/icon-maskable-512.png", "image/png"),
+    "/icons/apple-touch-icon.png": ("icons/apple-touch-icon.png", "image/png"),
 }
+# Served without the invite check: browsers fetch the manifest and icons without cookies,
+# and none of these contain personal data.
+PUBLIC_PATHS = {"/favicon.ico", "/manifest.webmanifest", "/sw.js", "/icons/icon-192.png", "/icons/icon-512.png",
+                "/icons/icon-maskable-512.png", "/icons/apple-touch-icon.png"}
+INVITE_FORM_MAX = 2048
 CSP = (
     "default-src 'self'; "
     "script-src 'self' https://accounts.google.com/gsi/client; "
@@ -189,7 +201,16 @@ class Response:
         self.headers: list[tuple[str, str]] = []
 
 
-def gate_page(title: str, detail: str) -> Response:
+INVITE_FORM_HTML = """<form method="post" action="/invite" style="margin:20px 0 0;text-align:left">
+<label for="code" style="display:block;margin-bottom:6px;color:#4a5164;font-size:13px">초대 링크 또는 코드</label>
+<input id="code" name="code" required autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="받은 링크를 그대로 붙여 넣어도 돼요"
+ style="box-sizing:border-box;width:100%;min-height:44px;padding:10px 12px;border:1px solid #dcdbe6;border-radius:12px;font-size:15px">
+<button type="submit" style="width:100%;min-height:44px;margin-top:10px;border:0;border-radius:12px;background:#5365c7;color:#fff;font-size:15px;font-weight:700">들어가기</button>
+<p style="margin:10px 0 0;color:#9195a0;font-size:12px;line-height:1.5">홈 화면에 설치한 앱에서 이 화면이 보이면, 받은 초대 링크를 여기에 붙여 넣어 주세요.</p>
+</form>"""
+
+
+def gate_page(title: str, detail: str, form: bool = False) -> Response:
     """Plain page shown instead of the app to browsers without an invite."""
     body = f"""<!doctype html><html lang="ko"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1"><meta name="robots" content="noindex">
@@ -202,6 +223,7 @@ box-shadow:0 12px 32px rgb(34 40 56 / 5%);text-align:center">
 <div style="display:inline-grid;width:44px;height:44px;place-items:center;border-radius:14px;background:#5365c7;color:#fff;font-size:20px">🔒</div>
 <h1 style="margin:18px 0 8px;font-size:22px;letter-spacing:-.04em">{html.escape(title)}</h1>
 <p style="margin:0;color:#72798a;font-size:14px;line-height:1.6">{html.escape(detail)}</p>
+{INVITE_FORM_HTML if form else ""}
 <p style="margin:18px 0 0;color:#9195a0;font-size:12px">Healthlingo</p>
 </main></body></html>"""
     resp = Response(403, raw=body.encode("utf-8"), content_type="text/html; charset=utf-8")
@@ -221,6 +243,9 @@ class App:
         self.keys = key_store or auth.GoogleKeyStore()
         self._busy: set[str] = set()
         self._busy_lock = threading.Lock()
+        self.today_override: date | None = None  # tests: pretend the server's date
+        self.run_jobs_inline = False  # tests: run the AI routine review in the request instead of a thread
+        self._pending_reviews: dict[str, tuple] = {}
         R = self._route
         self.routes = [
             R("GET", r"/api/config", self.get_config, auth_required=False),
@@ -255,6 +280,7 @@ class App:
             R("GET", r"/api/workout-plan", self.get_workout_plan),
             R("POST", r"/api/workout-plan", self.create_workout_plan),
             R("PUT", r"/api/exercise-checks", self.put_exercise_check),
+            R("PUT", r"/api/workout-feedback", self.put_workout_feedback),
             R("GET", r"/api/nutrition-target", self.get_nutrition_target),
             R("POST", r"/api/nutrition-target/explain", self.explain_nutrition_target),
         ]
@@ -289,28 +315,50 @@ class App:
         token = read_cookie(handler.headers.get_all("Cookie") or [], ACCESS_COOKIE)
         return bool(token) and hmac.compare_digest(token, self._access_token())
 
+    def _grant_access(self) -> Response:
+        """Remember this browser, then go to the app (and drop the code from the address bar)."""
+        resp = Response(303, raw=b"", content_type="text/plain; charset=utf-8")
+        resp.headers.append(("Location", "/"))
+        resp.headers.append(("Referrer-Policy", "no-referrer"))
+        resp.headers.append(("Set-Cookie", self._cookie(ACCESS_COOKIE, self._access_token(), ACCESS_DAYS * 86400)))
+        return resp
+
+    def _invite_form(self, handler: "Handler") -> Response:
+        """The invite link or code pasted into the gate page. Needed for apps installed on iPhone,
+        which keep their own cookies apart from Safari, so the link opened in Safari does not carry over."""
+        try:
+            length = int(handler.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = 0
+        raw = handler.rfile.read(length) if 0 < length <= INVITE_FORM_MAX else b""
+        handler.body_consumed = length <= INVITE_FORM_MAX
+        given = (parse_qs(raw.decode("utf-8", "replace")).get("code") or [""])[0].strip()
+        if "invite=" in given:  # the whole link was pasted
+            given = (parse_qs(urlsplit(given).query).get("invite") or [""])[0].strip()
+        if given and hmac.compare_digest(given.encode("utf-8"), self.settings.invite_code.encode("utf-8")):
+            return self._grant_access()
+        log.warning("초대 코드 입력 실패")
+        return gate_page("초대 링크가 올바르지 않아요.", "받은 초대 링크 전체나 코드를 다시 붙여 넣어 주세요.", form=True)
+
     def _invite_gate(self, handler: "Handler", method: str, path: str) -> Response | None:
         """Returns a response that stops the request, or None to let it through."""
         if not self.settings.invite_code:
             return None
-        if method == "GET" and path == "/favicon.ico":
+        if method == "GET" and path in PUBLIC_PATHS:
             return None
+        if method == "POST" and path == "/invite":
+            return self._invite_form(handler)
         query = parse_qs(urlsplit(handler.path).query)
         if method == "GET" and "invite" in query and not path.startswith("/api/"):
             given = query["invite"][0]
             if hmac.compare_digest(given.encode("utf-8"), self.settings.invite_code.encode("utf-8")):
-                # Remember this browser, then drop the code from the address bar and history.
-                resp = Response(303, raw=b"", content_type="text/plain; charset=utf-8")
-                resp.headers.append(("Location", "/"))
-                resp.headers.append(("Referrer-Policy", "no-referrer"))
-                resp.headers.append(("Set-Cookie", self._cookie(ACCESS_COOKIE, self._access_token(), ACCESS_DAYS * 86400)))
-                return resp
-            return gate_page("초대 링크가 올바르지 않거나 더 이상 사용할 수 없어요.", "초대한 사람에게 새 링크를 요청해 주세요.")
+                return self._grant_access()
+            return gate_page("초대 링크가 올바르지 않거나 더 이상 사용할 수 없어요.", "초대한 사람에게 새 링크를 요청해 주세요.", form=True)
         if self._has_access(handler):
             return None
         if path.startswith("/api/"):
             raise HTTPError(403, "invite_required", "초대 링크로 접속해야 이용할 수 있어요. 받은 링크를 다시 열어 주세요.")
-        return gate_page("초대받은 사람만 이용할 수 있어요.", "받은 초대 링크를 그대로 열어 주세요.")
+        return gate_page("초대받은 사람만 이용할 수 있어요.", "받은 초대 링크를 그대로 열거나, 아래에 붙여 넣어 주세요.", form=True)
 
     # ------------------------------------------------------------ dispatch
 
@@ -509,6 +557,7 @@ class App:
         with self.db.write_lock:
             current = self._load_settings(uid)
             updated = normalize_settings(raw, current, now_iso())
+            routine_inputs_changed = self._workout_hash(workout_profile(current)) != self._workout_hash(workout_profile(updated))
             with self.db.connect() as conn:
                 conn.execute(
                     "INSERT INTO user_settings (user_id, data, updated_at) VALUES (?, ?, ?) "
@@ -516,14 +565,19 @@ class App:
                     (uid, dumps(updated), now_iso()),
                 )
             changed = self._refresh_targets(uid, updated, today)
-        return Response(body={"settings": updated, "nutrition": self._nutrition_payload(uid, today), "nutrition_changed": changed})
+        # body values, goal or exercise plan changed: the AI reviews this week's routine on its own
+        review = self._request_review(uid, date.fromisoformat(today), "settings") if routine_inputs_changed else False
+        return Response(body={"settings": updated, "nutrition": self._nutrition_payload(uid, today), "nutrition_changed": changed,
+                              "routine_review_started": review})
 
     # ------------------------------------------------------------ nutrition targets
 
-    @staticmethod
-    def _client_today(value) -> str:
+    def server_today(self) -> date:
+        return self.today_override or datetime.now(timezone.utc).date()
+
+    def _client_today(self, value) -> str:
         """The user's local date (sent by the browser), if it is plausible; else the server's date."""
-        server = datetime.now(timezone.utc).date()
+        server = self.server_today()
         try:
             day = date.fromisoformat(parse_date(value))
             if abs((day - server).days) <= 1:
@@ -1258,57 +1312,404 @@ class App:
             conn.execute("DELETE FROM activities WHERE user_id = ? AND date = ? AND kind = ?", (req.user["id"], day, kind))
         return Response(body={"ok": True, "date": day, "kind": kind, "done": False})
 
-    # ------------------------------------------------------------ workout routine
+    # ------------------------------------------------------------ workout routine (saved per week)
+
+    REVIEW_STALE = timedelta(minutes=4)
+    TRIGGER_TEXT = {"feedback": "피드백 저장", "settings": "개인 설정 변경", "new_week": "새 주 준비"}
 
     def _workout_hash(self, profile: dict) -> str:
         return hashlib.sha256(dumps(profile).encode("utf-8")).hexdigest()
 
-    def _last_week_review(self, uid: int, plan: dict, created_at: str, today: date) -> dict | None:
-        monday = progression.week_start(today) - timedelta(days=7)
+    def _migrate_legacy_plan(self, conn, uid: int) -> None:
+        """Routines saved before weekly storage: move the single saved plan into the week it was made in."""
+        if conn.execute("SELECT 1 FROM week_plans WHERE user_id = ? LIMIT 1", (uid,)).fetchone():
+            return
+        row = conn.execute("SELECT * FROM workout_plans WHERE user_id = ?", (uid,)).fetchone()
+        if row is None:
+            return
+        monday = progression.week_start(date.fromisoformat(row["created_at"][:10])).isoformat()
+        conn.execute("INSERT OR IGNORE INTO week_plans (user_id, week_start, plan, input_hash, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+                     (uid, monday, row["plan"], row["input_hash"], row["created_at"], row["created_at"]))
+
+    def _week_row(self, uid: int, monday: date):
+        with self.db.write_lock, self.db.connect() as conn:
+            self._migrate_legacy_plan(conn, uid)
+            return conn.execute("SELECT * FROM week_plans WHERE user_id = ? AND week_start = ?", (uid, monday.isoformat())).fetchone()
+
+    def _checks_between(self, uid: int, start: date, end: date) -> set[tuple[str, str]]:
         with self.db.connect() as conn:
             rows = conn.execute("SELECT date, item FROM exercise_checks WHERE user_id = ? AND date BETWEEN ? AND ?",
-                                (uid, monday.isoformat(), (monday + timedelta(days=6)).isoformat())).fetchall()
-        return progression.review_week(plan, date.fromisoformat(created_at[:10]), {(r["date"], r["item"]) for r in rows}, monday)
+                                (uid, start.isoformat(), end.isoformat())).fetchall()
+        return {(r["date"], r["item"]) for r in rows}
 
-    def _maybe_adjust_workout(self, uid: int, today: date) -> None:
-        """Once per week: look at last week's completion and make the saved routine easier or harder."""
-        this_monday = progression.week_start(today).isoformat()
-        with self.db.write_lock:
-            with self.db.connect() as conn:
-                row = conn.execute("SELECT plan, created_at FROM workout_plans WHERE user_id = ?", (uid,)).fetchone()
-            if row is None:
-                return
-            plan = loads(row["plan"])
-            if plan.get("format", 1) < 3 or plan.get("adjusted_week") == this_monday:
-                return
-            review = self._last_week_review(uid, plan, row["created_at"], today)
-            new = plan
-            if review:
-                new, changes = progression.adjust_plan(plan, review["level"])
-                entry = {**review, "applied_week": this_monday, "changes": changes, "source": "auto"}
-                new["adjustments"] = [entry] + plan.get("adjustments", [])[:7]
-            new["adjusted_week"] = this_monday
-            with self.db.connect() as conn:
-                conn.execute("UPDATE workout_plans SET plan = ? WHERE user_id = ?", (dumps(new), uid))
+    def _feedback_rows(self, uid: int, start: date, end: date) -> list:
+        with self.db.connect() as conn:
+            return conn.execute("SELECT * FROM workout_feedback WHERE user_id = ? AND date BETWEEN ? AND ? ORDER BY date",
+                                (uid, start.isoformat(), end.isoformat())).fetchall()
 
-    def _workout_payload(self, uid: int, today: date | None = None) -> dict:
-        if today is not None:
-            self._maybe_adjust_workout(uid, today)
+    @staticmethod
+    def _feedback_out(row) -> dict | None:
+        if row is None:
+            return None
+        return {"id": row["id"], "date": row["date"], "text": row["text"], "label": row["text"] or "피드백 없음",
+                "interpretation": loads(row["interpretation"]), "limits": loads(row["limits"]) or [],
+                "intensity_applied": bool(row["intensity_applied"]), "updated_at": row["updated_at"]}
+
+    @staticmethod
+    def _day_progress(plan: dict, monday: date, checks: set) -> dict:
+        """{"<weekday>": {"done": n, "planned": m}} from the saved completion checks."""
+        out = {}
+        for s in plan.get("sessions", []):
+            wd = s.get("weekday")
+            if wd is None:
+                continue
+            day = (monday + timedelta(days=wd)).isoformat()
+            keys = [progression.exercise_key(i, ex["name"]) for i, ex in enumerate(s["exercises"])]
+            out[str(wd)] = {"done": sum(1 for k in keys if (day, k) in checks), "planned": len(keys)}
+        return out
+
+    def _review_out(self, row) -> dict:
+        if row is None:
+            return {"status": "none", "message": "", "trigger": "", "trigger_label": ""}
+        status, message = row["review_status"], row["review_message"]
+        if status == "running" and row["review_started_at"]:
+            started = datetime.strptime(row["review_started_at"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+            if datetime.now(timezone.utc) - started > self.REVIEW_STALE:
+                status, message = "failed", "AI 자동 조정이 중단됐어요. 기존 계획과 기록은 그대로예요."
+        return {"status": status, "message": message, "trigger": row["review_trigger"],
+                "trigger_label": self.TRIGGER_TEXT.get(row["review_trigger"], "")}
+
+    def _set_review(self, uid: int, monday: date, status: str, message: str, trigger: str) -> None:
+        with self.db.write_lock, self.db.connect() as conn:
+            conn.execute(
+                "UPDATE week_plans SET review_status = ?, review_message = ?, review_trigger = ?, "
+                "review_started_at = CASE WHEN ? = 'running' THEN ? ELSE review_started_at END WHERE user_id = ? AND week_start = ?",
+                (status, message, trigger, status, now_iso(), uid, monday.isoformat()))
+
+    def _week_finished(self, uid: int, row, today: date) -> bool:
+        """Nothing left to do this week: no session after today, and today's session (if any) fully done."""
+        sessions = {s.get("weekday"): s for s in loads(row["plan"]).get("sessions", []) if s.get("weekday") is not None}
+        wd = today.weekday()
+        if any(k > wd for k in sessions):
+            return False
+        if wd not in sessions:
+            return True
+        p = self._day_progress({"sessions": [sessions[wd]]}, progression.week_start(today), self._checks_between(uid, today, today)).get(str(wd))
+        return bool(p) and p["done"] >= p["planned"]
+
+    def _start_week_from_previous(self, uid: int, monday: date, today: date) -> bool:
+        """A new week starts as a copy of the latest earlier week; the AI then reviews it in the background."""
+        with self.db.write_lock, self.db.connect() as conn:
+            if conn.execute("SELECT 1 FROM week_plans WHERE user_id = ? AND week_start = ?", (uid, monday.isoformat())).fetchone():
+                return False
+            prev = conn.execute("SELECT * FROM week_plans WHERE user_id = ? AND week_start < ? ORDER BY week_start DESC LIMIT 1",
+                                (uid, monday.isoformat())).fetchone()
+            if prev is None:
+                return False
+            plan = loads(prev["plan"])
+            if plan.get("format", 1) < 3:
+                return False
+            copy = {k: plan[k] for k in ("sessions", "summary", "cautions", "model", "format") if k in plan}
+            # Days changed only because of temporary feedback ("내일만 20분", "이번 주만 바빠요") go back to normal.
+            by_day = {s["weekday"]: s for s in copy.get("sessions", []) if s.get("weekday") is not None}
+            restored = []
+            for key, original in (plan.get("temporary_originals") or {}).items():
+                wd = int(key)
+                if original:
+                    by_day[wd] = original
+                else:
+                    by_day.pop(wd, None)
+                restored.append(wd)
+            copy["sessions"] = [by_day[k] for k in sorted(by_day)]
+            copy.update({"copied_from": prev["week_start"], "adjustments": [], "agent": {}, "rest_overrides": {},
+                         "restored_temporary_days": sorted(restored)})
+            now = now_iso()
+            conn.execute(
+                "INSERT INTO week_plans (user_id, week_start, plan, input_hash, created_at, updated_at, review_status, review_trigger, review_started_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, 'running', 'new_week', ?)",
+                (uid, monday.isoformat(), dumps(copy), prev["input_hash"], now, now, now))
+        self._start_agent_job(uid, monday, "new_week", today)
+        return True
+
+    def _ensure_week(self, uid: int, today: date) -> None:
+        """This week always has a routine once the user has one; next week is prepared when this week is done."""
+        monday = progression.week_start(today)
+        row = self._week_row(uid, monday)
+        if row is None:
+            self._start_week_from_previous(uid, monday, today)
+            return
+        nxt = monday + timedelta(days=7)
+        if row["review_status"] != "running" and self._week_row(uid, nxt) is None and self._week_finished(uid, row, today):
+            self._start_week_from_previous(uid, nxt, today)
+
+    # --- automatic AI review ---------------------------------------------------
+
+    def _start_agent_job(self, uid: int, monday: date, trigger: str, today: date) -> None:
+        if self.run_jobs_inline:
+            self._run_agent_job(uid, monday, trigger, today)
+        else:
+            threading.Thread(target=self._run_agent_job, args=(uid, monday, trigger, today), name="routine-agent", daemon=True).start()
+
+    def _request_review(self, uid: int, today: date, trigger: str) -> bool:
+        """Review this week's routine after a feedback or settings change. Returns True when started."""
+        monday = progression.week_start(today)
+        row = self._week_row(uid, monday)
+        if row is None or loads(row["plan"]).get("format", 1) < 3:
+            return False
+        self._set_review(uid, monday, "running", "", trigger)
+        self._start_agent_job(uid, monday, trigger, today)
+        return True
+
+    def _run_agent_job(self, uid: int, monday: date, trigger: str, today: date) -> str:
+        key = f"agent:{uid}:{monday.isoformat()}"
+        with self._busy_lock:
+            if key in self._busy:  # already running: run once more afterwards with the newest inputs
+                self._pending_reviews[key] = (trigger, today)
+                return "queued"
+            self._busy.add(key)
+        try:
+            status = self._review_week(uid, monday, trigger, today)
+        finally:
+            with self._busy_lock:
+                self._busy.discard(key)
+                again = self._pending_reviews.pop(key, None)
+        return self._run_agent_job(uid, monday, *again) if again else status
+
+    def _review_week(self, uid: int, monday: date, trigger: str, today: date) -> str:
+        try:
+            if not self.ai.configured:
+                self._set_review(uid, monday, "failed", "AI가 설정되지 않아 자동 조정을 하지 못했어요. 기존 계획을 그대로 써요.", trigger)
+                return "failed"
+            prepared = self._agent_inputs(uid, monday, today)
+            if prepared is None:
+                self._set_review(uid, monday, "idle", "", trigger)
+                return "idle"
+            context, base_row, base, check_ctx, sig = prepared
+            if sig == (base.get("agent") or {}).get("last_sig"):
+                self._set_review(uid, monday, "up_to_date", "새로 반영할 피드백이나 설정 변경이 없어 계획을 그대로 유지해요.", trigger)
+                return "up_to_date"
+            result = routine_agent.run_agent(
+                self.ai, context,
+                check=lambda proposal: routine_agent.check_proposal(base, proposal, check_ctx),
+                history=lambda weeks: self._agent_history(uid, monday, weeks))
+            self._apply_agent_result(uid, monday, base_row, result, trigger, sig, check_ctx)
+            return "done"
+        except AIError as exc:
+            log.warning("루틴 자동 조정 실패 (%s): %s", exc.code, exc.message)
+            message = exc.message if "기존 계획" in exc.message else f"{exc.message} 루틴은 기존 계획 그대로예요."
+            self._set_review(uid, monday, "failed", message, trigger)
+            return "failed"
+        except Exception:  # never lose the plan because of a bug in the review
+            log.exception("루틴 자동 조정 오류")
+            self._set_review(uid, monday, "failed", "자동 조정 중 오류가 나서 기존 계획과 기록을 그대로 유지했어요.", trigger)
+            return "failed"
+
+    def _agent_inputs(self, uid: int, monday: date, today: date):
+        row = self._week_row(uid, monday)
+        if row is None:
+            return None
+        base = loads(row["plan"])
+        if base.get("format", 1) < 3:
+            return None
         settings = self._load_settings(uid)
         profile = workout_profile(settings)
-        with self.db.connect() as conn:
-            row = conn.execute("SELECT * FROM workout_plans WHERE user_id = ?", (uid,)).fetchone()
+        schedule = training_schedule(settings)
+        week_dates = [(monday + timedelta(days=i)).isoformat() for i in range(7)]
+        this_week = monday == progression.week_start(today)
+        first_editable = today.weekday() if this_week else (0 if monday > today else 7)
+        agent_state = base.get("agent") or {}
+        mode = "new_week" if base.get("copied_from") and not agent_state.get("runs") else "this_week"
+        last_monday = date.fromisoformat(base["copied_from"]) if base.get("copied_from") else monday - timedelta(days=7)
+        checks = self._checks_between(uid, monday, monday + timedelta(days=6))
+        last_row = self._week_row(uid, last_monday)
+        last_checks = self._checks_between(uid, last_monday, last_monday + timedelta(days=6))
+        feedback = [self._feedback_out(r) for r in self._feedback_rows(uid, last_monday, monday + timedelta(days=6))]
+
+        sessions = {s["weekday"]: s for s in base.get("sessions", []) if s.get("weekday") is not None}
+        locked: dict[int, dict] = {}
+        if this_week and today.weekday() in sessions:
+            for i, ex in enumerate(sessions[today.weekday()]["exercises"]):
+                if (today.isoformat(), progression.exercise_key(i, ex["name"])) in checks:
+                    locked.setdefault(today.weekday(), {})[i] = ex
+        temp_limits: dict[str, int] = {}
+
+        def add_limit(iso, minutes):
+            if iso in week_dates and minutes:
+                temp_limits[iso] = min(temp_limits.get(iso, minutes), int(minutes))
+        for f in feedback:
+            for lim in f["limits"]:
+                add_limit(lim.get("date"), lim.get("max_minutes"))
+            it = f["interpretation"] or {}
+            if it.get("max_minutes"):
+                for iso in week_dates:
+                    if (it.get("applies_from") or "") <= iso <= (it.get("applies_to") or ""):
+                        add_limit(iso, it["max_minutes"])
+        recent_from = (today - timedelta(days=6)).isoformat()
+        pain_recent = any(recent_from <= f["date"] <= today.isoformat()
+                          and (routine_agent.has_pain(f["text"]) or (f["interpretation"] or {}).get("kind") == "pain") for f in feedback)
+        records_sig = hashlib.sha256(dumps({"week": sorted(checks), "last": sorted(last_checks) if mode == "new_week" else [],
+                                            "days_passed": first_editable}).encode("utf-8")).hexdigest()
+        base_loads: dict[str, float] = {}
+        for s in sessions.values():
+            for ex in s["exercises"]:
+                if ex.get("weight_kg"):
+                    base_loads[ex["name"]] = max(base_loads.get(ex["name"], 0), ex["weight_kg"])
+        levels = [INTENSITIES.index(s["intensity"]) for s in sessions.values() if s.get("intensity") in INTENSITIES]
+        user_rest = set(schedule["rest_days"]) if schedule["source"] == "rest_days" else set()
+        check_ctx = {
+            "week_dates": week_dates, "first_editable": first_editable, "user_rest_days": user_rest,
+            "training_days": set(schedule["training_days"]) if schedule["source"] == "rest_days" else set(),
+            "minutes_limit": settings.get("minutes_per_session"), "temp_limits": temp_limits, "locked": locked,
+            "weighted_ok": bool(set(settings.get("equipment") or []) & routine_agent.LOAD_GEAR) or bool((settings.get("equipment_note") or "").strip()),
+            "pain_recent": pain_recent, "feedback_ids": {f["id"] for f in feedback},
+            "consumed_feedback": {f["id"] for f in feedback if f["intensity_applied"]},
+            "records_new": records_sig != agent_state.get("intensity_records_sig"), "records_sig": records_sig,
+            "body_weight": (settings.get("body") or {}).get("weight_kg"),
+            "base_loads": base_loads, "base_max_intensity": max(levels) if levels else None,
+        }
+
+        def day_entry(wd: int) -> dict:
+            iso, s = week_dates[wd], sessions.get(wd)
+            status = ("past" if wd < today.weekday() else "today" if wd == today.weekday() else "future") if this_week else "future"
+            entry = {"weekday": WEEKDAY_NAMES[wd], "date": iso, "status": status, "editable": wd >= first_editable,
+                     "user_rest_weekday": wd in user_rest, "rest_override": str(wd) in (base.get("rest_overrides") or {}),
+                     "time_limit_minutes": temp_limits.get(iso), "session": None}
+            if s:
+                exercises = [{"index": i, "name": ex["name"], "amount": ex.get("amount", ""), "weight_kg": ex.get("weight_kg"),
+                              "weight_note": ex.get("weight_note", ""), "done": (iso, progression.exercise_key(i, ex["name"])) in checks}
+                             for i, ex in enumerate(s["exercises"])]
+                entry["session"] = {"title": s["title"], "focus": s.get("focus", ""), "minutes": s["minutes"], "intensity": s["intensity"], "exercises": exercises}
+                entry["done_count"] = sum(1 for e in exercises if e["done"])
+                entry["planned_count"] = len(exercises)
+            return entry
+
+        last_week = None
+        if last_row is not None:
+            prog = self._day_progress(loads(last_row["plan"]), last_monday, last_checks)
+            planned = sum(v["planned"] for v in prog.values())
+            last_week = {"week_start": last_monday.isoformat(),
+                         "days": [{"weekday": WEEKDAY_NAMES[int(k)], **v} for k, v in sorted(prog.items())],
+                         "completion_rate": round(sum(v["done"] for v in prog.values()) / planned, 2) if planned else None}
+        context = {
+            "mode": mode, "today": today.isoformat(), "today_weekday": WEEKDAY_NAMES[today.weekday()], "week_start": monday.isoformat(),
+            "editable_from": WEEKDAY_NAMES[first_editable] if first_editable < 7 else "없음",
+            "user": profile, "week": [day_entry(wd) for wd in range(7)],
+            "feedback": [{"id": f["id"], "date": f["date"], "text": f["label"], "interpretation": f["interpretation"],
+                          "intensity_already_applied": f["intensity_applied"], "server_time_limits": f["limits"]} for f in feedback],
+            "recent_pain": pain_recent, "last_week_results": last_week,
+            "restored_after_temporary_feedback": [WEEKDAY_NAMES[d] for d in base.get("restored_temporary_days", [])] if mode == "new_week" else [],
+            "recent_adjustments": [{"at": a.get("at"), "decision": a.get("decision"), "summary": a.get("summary")}
+                                   for a in (base.get("adjustments") or []) if a.get("source") == "agent"][:3],
+        }
+        sig = hashlib.sha256(dumps({"profile": profile, "feedback": [(f["id"], f["text"], f["updated_at"]) for f in feedback],
+                                    "records": records_sig, "mode": mode}).encode("utf-8")).hexdigest()
+        return context, row, base, check_ctx, sig
+
+    def _agent_history(self, uid: int, monday: date, weeks: int) -> dict:
+        """Tool for the AI: earlier weeks' plans, completion per day and feedback."""
+        out = []
+        for k in range(1, weeks + 1):
+            m = monday - timedelta(days=7 * k)
+            end = m + timedelta(days=6)
+            feedback = [{"date": f["date"], "text": f["label"]} for f in map(self._feedback_out, self._feedback_rows(uid, m, end))]
+            row = self._week_row(uid, m)
+            if row is None:
+                out.append({"week_start": m.isoformat(), "plan": None, "feedback": feedback})
+                continue
+            plan = loads(row["plan"])
+            prog = self._day_progress(plan, m, self._checks_between(uid, m, end))
+            out.append({
+                "week_start": m.isoformat(),
+                "sessions": [{"weekday": WEEKDAY_NAMES[s["weekday"]], "title": s["title"], "intensity": s["intensity"], "minutes": s["minutes"],
+                              "exercises": [f"{e['name']} {e.get('amount', '')}" + (f" {e['weight_kg']}kg" if e.get("weight_kg") else "") for e in s["exercises"]],
+                              **prog.get(str(s["weekday"]), {})}
+                             for s in plan.get("sessions", []) if s.get("weekday") is not None],
+                "feedback": feedback,
+                "adjustments": [a.get("summary") for a in plan.get("adjustments", []) if a.get("source") == "agent"][:3],
+            })
+        return {"weeks": out}
+
+    def _apply_agent_result(self, uid: int, monday: date, base_row, result: dict, trigger: str, sig: str, check_ctx: dict) -> None:
+        proposal, candidate = result["proposal"], result["candidate"]
+        decision = proposal["decision"]
+        profile_hash = self._workout_hash(workout_profile(self._load_settings(uid)))
+        with self.db.write_lock, self.db.connect() as conn:
+            row = conn.execute("SELECT * FROM week_plans WHERE user_id = ? AND week_start = ?", (uid, monday.isoformat())).fetchone()
+            if row is None or row["updated_at"] != base_row["updated_at"]:
+                raise AIError("AI가 검토하는 동안 루틴이 바뀌어 이번 조정은 반영하지 않았어요.", True, "agent_conflict")
+            # an exercise checked while the AI was working must still be in place
+            by_day = {s["weekday"]: s for s in candidate["sessions"]}
+            for r in conn.execute("SELECT date, item FROM exercise_checks WHERE user_id = ? AND date BETWEEN ? AND ?",
+                                  (uid, check_ctx["week_dates"][0], check_ctx["week_dates"][6])).fetchall():
+                wd = check_ctx["week_dates"].index(r["date"])
+                if wd < check_ctx["first_editable"]:
+                    continue
+                idx, _, name = r["item"].partition(":")
+                s = by_day.get(wd)
+                if not idx.isdigit() or not s or int(idx) >= len(s["exercises"]) or s["exercises"][int(idx)]["name"] != name:
+                    raise AIError("AI가 검토하는 동안 완료한 운동이 생겨 이번 조정은 반영하지 않았어요.", True, "agent_conflict")
+            agent = {**(candidate.get("agent") or {}), "last_sig": sig, "runs": (candidate.get("agent") or {}).get("runs", 0) + 1}
+            if decision in ("increase", "decrease") and proposal.get("based_on_records"):
+                agent["intensity_records_sig"] = check_ctx["records_sig"]
+            summary = [s.strip()[:160] for s in proposal.get("summary") or [] if isinstance(s, str) and s.strip()][:4] or ["지금 계획을 그대로 유지해요."]
+            entry = {"source": "agent", "at": now_iso(), "trigger": trigger, "decision": decision, "summary": summary,
+                     "changed_days": sorted(result["changed"]), "model": result["model"] or self.settings.ai_model,
+                     "turns": result["turns"], "tools": result["tools"], "failed_submits": result["failed_submits"]}
+            # Remember what a day looked like before a temporary change, so next week starts from the normal version.
+            temporary = set(check_ctx["temp_limits"])
+            for note in proposal.get("feedback_notes") or []:
+                if note.get("scope") in ("day", "this_week"):
+                    temporary |= {iso for iso in check_ctx["week_dates"] if (note.get("applies_from") or "") <= iso <= (note.get("applies_to") or "")}
+            base_sessions = {s["weekday"]: s for s in loads(base_row["plan"]).get("sessions", []) if s.get("weekday") is not None}
+            originals = dict(candidate.get("temporary_originals") or {})
+            for wd in result["changed"]:
+                if check_ctx["week_dates"][wd] in temporary:
+                    originals.setdefault(str(wd), base_sessions.get(wd))
+                else:
+                    originals.pop(str(wd), None)  # changed again for a lasting reason: the new version is the normal one
+            plan = {**candidate, "agent": agent, "temporary_originals": originals,
+                    "adjustments": [entry] + (candidate.get("adjustments") or [])[:9]}
+            conn.execute(
+                "UPDATE week_plans SET plan = ?, input_hash = ?, updated_at = ?, review_status = 'done', review_message = ?, review_trigger = ? "
+                "WHERE user_id = ? AND week_start = ?",
+                (dumps(plan), profile_hash, now_iso(), " ".join(summary)[:300], trigger, uid, monday.isoformat()))
+            for note in proposal.get("feedback_notes") or []:
+                conn.execute("UPDATE workout_feedback SET interpretation = ? WHERE id = ? AND user_id = ?", (dumps(note), note["feedback_id"], uid))
+            if decision in ("increase", "decrease"):
+                for fid in proposal.get("based_on_feedback_ids") or []:
+                    conn.execute("UPDATE workout_feedback SET intensity_applied = 1 WHERE id = ? AND user_id = ?", (fid, uid))
+
+    # --- payloads and endpoints --------------------------------------------------
+
+    def _workout_payload(self, uid: int, today: date | None = None) -> dict:
+        today = today or self.server_today()
+        self._ensure_week(uid, today)
+        settings = self._load_settings(uid)
+        profile = workout_profile(settings)
+        monday = progression.week_start(today)
+        row = self._week_row(uid, monday)
         plan = None
         if row:
-            plan = {**loads(row["plan"]), "created_at": row["created_at"], "stale": row["input_hash"] != self._workout_hash(profile)}
-        return {"body": body_metrics(settings), "plan": plan, "schedule": training_schedule(settings)}
+            stored = loads(row["plan"])
+            stored.pop("agent", None)
+            stored.pop("temporary_originals", None)
+            checks = self._checks_between(uid, monday, monday + timedelta(days=6))
+            plan = {**stored, "created_at": row["created_at"], "updated_at": row["updated_at"], "week_start": row["week_start"],
+                    "stale": row["input_hash"] != self._workout_hash(profile), "progress": self._day_progress(stored, monday, checks)}
+        nxt = self._week_row(uid, monday + timedelta(days=7))
+        fb = self._feedback_rows(uid, today, today)
+        return {"body": body_metrics(settings), "plan": plan, "schedule": training_schedule(settings), "week_start": monday.isoformat(),
+                "review": self._review_out(row), "feedback_today": self._feedback_out(fb[0] if fb else None),
+                "next_week": {"week_start": (monday + timedelta(days=7)).isoformat(), "ready": nxt is not None, "review": self._review_out(nxt)}}
 
     def _today_workout(self, uid: int, today: date) -> dict:
         """Today's part of the weekly routine, for the Today tab."""
         payload = self._workout_payload(uid, today)
         plan, schedule = payload["plan"], payload["schedule"]
         weekday = today.weekday()
-        out = {"weekday": weekday, "status": "no_plan", "session": None, "stale": bool(plan and plan["stale"]), "rest_source": schedule["source"]}
+        latest = next((a for a in (plan or {}).get("adjustments", []) if a.get("source") == "agent"), None)
+        out = {"weekday": weekday, "status": "no_plan", "session": None, "stale": bool(plan and plan["stale"]), "rest_source": schedule["source"],
+               "review": payload["review"], "feedback": payload["feedback_today"], "latest_adjustment": latest}
         # A rest day chosen by the user always wins, even over an older routine.
         if schedule["source"] == "rest_days" and weekday in schedule["rest_days"]:
             return {**out, "status": "rest"}
@@ -1318,19 +1719,33 @@ class App:
             return {**out, "status": "outdated"}
         session = next((s for s in plan["sessions"] if s.get("weekday") == weekday), None)
         if session:
-            exercises = [{**ex, "key": f"{i}:{ex['name']}"[:100]} for i, ex in enumerate(session["exercises"])]
+            exercises = [{**ex, "key": progression.exercise_key(i, ex["name"])} for i, ex in enumerate(session["exercises"])]
             keys = {ex["key"] for ex in exercises}
             with self.db.connect() as conn:
                 rows = conn.execute("SELECT item FROM exercise_checks WHERE user_id = ? AND date = ?", (uid, today.isoformat())).fetchall()
             checked = [r["item"] for r in rows if r["item"] in keys]
             return {**out, "status": "workout", "session": {**session, "exercises": exercises}, "checked": checked}
-        if weekday in schedule["rest_days"]:
+        if weekday in schedule["rest_days"] or str(weekday) in (plan.get("rest_overrides") or {}):
             return {**out, "status": "rest"}
         return {**out, "status": "unscheduled"}  # the routine was made before today became a workout day
 
     def get_workout_plan(self, req: Request) -> Response:
         today = date.fromisoformat(self._client_today(req.query.get("today")))
         return Response(body=self._workout_payload(req.user["id"], today))
+
+    def _keep_finished_days(self, uid: int, old: dict, new: dict, today: date) -> None:
+        """'루틴 다시 받기': days before today keep their old sessions, and today keeps its session if anything is done."""
+        wd = today.weekday()
+        old_s = {s["weekday"]: s for s in old.get("sessions", []) if s.get("weekday") is not None}
+        new_s = {s["weekday"]: s for s in new.get("sessions", []) if s.get("weekday") is not None}
+        for d in range(wd):
+            if d in old_s:
+                new_s[d] = old_s[d]
+            else:
+                new_s.pop(d, None)
+        if wd in old_s and self._checks_between(uid, today, today):
+            new_s[wd] = old_s[wd]
+        new["sessions"] = [new_s[k] for k in sorted(new_s)]
 
     def create_workout_plan(self, req: Request) -> Response:
         uid = req.user["id"]
@@ -1340,13 +1755,22 @@ class App:
             raise ValidationError("운동 루틴을 추천하려면 개인 설정에서 키와 몸무게를 먼저 입력해 주세요.")
         profile = workout_profile(settings)
         today = date.fromisoformat(self._client_today((req.json() or {}).get("today")))
-        with self.db.connect() as conn:
-            prev_row = conn.execute("SELECT plan, created_at FROM workout_plans WHERE user_id = ?", (uid,)).fetchone()
-        previous = loads(prev_row["plan"]) if prev_row else None
-        review = self._last_week_review(uid, previous, prev_row["created_at"], today) if previous and previous.get("format", 1) >= 3 else None
+        monday = progression.week_start(today)
+        row = self._week_row(uid, monday)
+        current = loads(row["plan"]) if row else None
+        last_monday = monday - timedelta(days=7)
+        last_row = self._week_row(uid, last_monday)
+        previous = current or (loads(last_row["plan"]) if last_row else None)
         ai_input = dict(profile)  # the hash below uses `profile` only, so a review never marks the routine stale
-        if review:
-            ai_input["progress_review"] = {"last_week_completion_rate": review["rate"], "done": review["done"], "planned": review["planned"], "adjustment": review["level"]}
+        # Last week's results, unless this week already had an automatic review (no double adjustment).
+        if last_row is not None and not (current and (current.get("agent") or {}).get("runs")):
+            last_plan = loads(last_row["plan"])
+            if last_plan.get("format", 1) >= 3:
+                review = progression.review_week(last_plan, date.fromisoformat(last_row["created_at"][:10]),
+                                                 self._checks_between(uid, last_monday, monday - timedelta(days=1)), last_monday)
+                if review:
+                    ai_input["progress_review"] = {"last_week_completion_rate": review["rate"], "done": review["done"], "planned": review["planned"]}
+        if previous and previous.get("format", 1) >= 3:
             ai_input["previous_plan"] = [
                 {"weekday": s.get("weekday"), "title": s["title"], "intensity": s["intensity"],
                  "exercises": [{"name": e["name"], "amount": e["amount"], "weight_kg": e.get("weight_kg")} for e in s["exercises"]]}
@@ -1361,19 +1785,47 @@ class App:
         finally:
             self._release(key)
         plan["model"] = plan.get("model") or self.settings.ai_model
-        if review:
-            capped = progression.cap_against_previous(plan, previous, review["level"])
-            plan["adjustments"] = [{**review, "applied_week": progression.week_start(today).isoformat(), "source": "ai",
-                                    "changes": ["지난주 달성도를 반영해 새 루틴을 만들었어요"] + ([f"안전을 위해 중량·강도 {capped}곳을 이전 루틴 기준으로 맞췄어요"] if capped else [])}]
-        plan["adjustments"] = plan.get("adjustments", []) + (previous or {}).get("adjustments", [])[:7]
-        plan["adjusted_week"] = progression.week_start(today).isoformat()  # this week is already reflected
+        notes = ["새 주간 루틴을 받았어요."]
+        if previous and previous.get("format", 1) >= 3:
+            capped = progression.cap_against_previous(plan, previous, "increase")
+            if capped:
+                notes.append(f"안전을 위해 중량·강도 {capped}곳을 이전 루틴보다 한 단계 안으로 맞췄어요.")
+        if current:
+            self._keep_finished_days(uid, current, plan, today)
+            if today.weekday():
+                notes.append("지난 요일과 이미 완료한 오늘 운동은 그대로 두었어요.")
+        plan["agent"] = {}
+        plan["adjustments"] = [{"source": "regenerate", "at": now_iso(), "summary": notes}] + ((current or {}).get("adjustments") or [])[:9]
+        now = now_iso()
         with self.db.write_lock, self.db.connect() as conn:
             conn.execute(
-                "INSERT INTO workout_plans (user_id, plan, input_hash, created_at) VALUES (?, ?, ?, ?) "
-                "ON CONFLICT(user_id) DO UPDATE SET plan = excluded.plan, input_hash = excluded.input_hash, created_at = excluded.created_at",
-                (uid, dumps(plan), self._workout_hash(profile), now_iso()),
-            )
-        return Response(body=self._workout_payload(uid))
+                "INSERT INTO week_plans (user_id, week_start, plan, input_hash, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(user_id, week_start) DO UPDATE SET plan = excluded.plan, input_hash = excluded.input_hash, "
+                "updated_at = excluded.updated_at, review_status = 'idle', review_message = '', review_trigger = ''",
+                (uid, monday.isoformat(), dumps(plan), self._workout_hash(profile), now, now))
+        return Response(body=self._workout_payload(uid, today))
+
+    def put_workout_feedback(self, req: Request) -> Response:
+        """'오늘 운동은 어떠셨나요?' Optional; an empty text is saved as 피드백 없음. Saving a changed text starts the AI review."""
+        uid = req.user["id"]
+        body = req.json()
+        day = date.fromisoformat(self._client_today(body.get("date")))
+        value = text(body.get("text"), 200, "피드백")
+        limits = routine_agent.parse_time_limits(value, day)
+        now = now_iso()
+        with self.db.write_lock, self.db.connect() as conn:
+            row = conn.execute("SELECT * FROM workout_feedback WHERE user_id = ? AND date = ?", (uid, day.isoformat())).fetchone()
+            changed = row is None or row["text"] != value
+            if row is None:
+                conn.execute("INSERT INTO workout_feedback (user_id, date, text, limits, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+                             (uid, day.isoformat(), value, dumps(limits), now, now))
+            elif changed:  # a new text is new information: read it again, and it may change intensity once
+                conn.execute("UPDATE workout_feedback SET text = ?, limits = ?, interpretation = NULL, intensity_applied = 0, updated_at = ? WHERE id = ?",
+                             (value, dumps(limits), now, row["id"]))
+        started = self._request_review(uid, day, "feedback") if changed else False
+        fb = self._feedback_rows(uid, day, day)
+        return Response(body={"feedback": self._feedback_out(fb[0] if fb else None), "changed": changed, "review_started": started,
+                              "review": self._review_out(self._week_row(uid, progression.week_start(day)))})
 
     def put_exercise_check(self, req: Request) -> Response:
         """Mark one exercise of the day's routine done / not done. A day with at least one
@@ -1435,7 +1887,7 @@ class App:
             meal_dates = [r["date"] for r in conn.execute("SELECT date FROM meals WHERE user_id = ?", (uid,))]
             body_dates = [r["date"] for r in conn.execute("SELECT date FROM body_logs WHERE user_id = ?", (uid,))]
             acts = conn.execute("SELECT date, kind FROM activities WHERE user_id = ?", (uid,)).fetchall()
-            has_plan = conn.execute("SELECT 1 FROM workout_plans WHERE user_id = ?", (uid,)).fetchone() is not None
+            has_plan = conn.execute("SELECT 1 FROM week_plans WHERE user_id = ? UNION SELECT 1 FROM workout_plans WHERE user_id = ?", (uid, uid)).fetchone() is not None
         act_dates = [a["date"] for a in acts]
         recorded = sorted(set(meal_dates) | set(body_dates) | set(act_dates))
         recorded_set = set(recorded)

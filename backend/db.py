@@ -125,7 +125,39 @@ CREATE TABLE IF NOT EXISTS exercise_checks (
     PRIMARY KEY (user_id, date, item)
 );
 
--- The latest AI workout routine per user. input_hash detects when body values or settings changed.
+-- One saved routine per user and week (week_start = Monday). Today's workout is read from here.
+-- review_*: the last automatic AI review of that week (idle | running | done | up_to_date | failed).
+CREATE TABLE IF NOT EXISTS week_plans (
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    week_start TEXT NOT NULL,
+    plan TEXT NOT NULL,
+    input_hash TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    review_status TEXT NOT NULL DEFAULT 'idle',
+    review_message TEXT NOT NULL DEFAULT '',
+    review_trigger TEXT NOT NULL DEFAULT '',
+    review_started_at TEXT,
+    PRIMARY KEY (user_id, week_start)
+);
+
+-- "오늘 운동은 어떠셨나요?" One per user and day; empty text = 피드백 없음.
+-- limits: time limits read from the text by the server; interpretation: the AI's reading (scope, period);
+-- intensity_applied: an increase/decrease based on this feedback was already applied (never twice).
+CREATE TABLE IF NOT EXISTS workout_feedback (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    date TEXT NOT NULL,
+    text TEXT NOT NULL DEFAULT '',
+    limits TEXT,
+    interpretation TEXT,
+    intensity_applied INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (user_id, date)
+);
+
+-- The latest AI workout routine per user (before routines were stored per week; read once and moved to week_plans). input_hash detects when body values or settings changed.
 CREATE TABLE IF NOT EXISTS workout_plans (
     user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
     plan TEXT NOT NULL,

@@ -4,6 +4,14 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="theme-color" content="#f7f6f2">
+  <!-- Installable app (PWA): Android/Chrome use the manifest, iPhone uses the apple-* tags -->
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="icon" type="image/png" sizes="192x192" href="/icons/icon-192.png">
+  <link rel="apple-touch-icon" href="/icons/apple-touch-icon.png">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="Healthlingo">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
   <title>Healthlingo — 오늘의 건강 리듬</title>
   <style>
     :root {
@@ -568,6 +576,14 @@
     .load-chip.light { background: #f0f1f6; color: #687083; font-weight: 650; }
     /* 오늘의 운동 목표 · 주간 편성 */
     .today-workout { margin-top: 15px; }
+    /* 오늘 운동 피드백 · AI 자동 조정 */
+    .tw-feedback { margin-top: 14px; padding: 13px 14px; border: 1px dashed #d9ddf0; border-radius: 14px; background: #fcfcff; }
+    .tw-feedback-title { display: block; margin-bottom: 8px; font-size: 13px; font-weight: 720; }
+    .tw-feedback .chip-row { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
+    .tw-feedback textarea { box-sizing: border-box; width: 100%; min-height: 58px; padding: 9px 11px; border: 1px solid var(--line); border-radius: 11px; font: inherit; font-size: 13px; resize: vertical; }
+    .tw-feedback-foot { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; margin-top: 8px; }
+    .adj-box ul { margin: 6px 0 0; padding-left: 18px; font-size: 11.5px; line-height: 1.6; }
+    .session-card .done-line { margin: -4px 0 8px; color: #4b7158; font-size: 11px; font-weight: 700; }
     .today-workout .tw-meta { margin: 0 0 11px; color: var(--muted); font-size: 11px; }
     .today-workout .tw-meta strong { color: var(--ink, #2b2f3a); font-size: 13px; margin-right: 6px; }
     .today-workout .mission-icon { font-size: 13px; font-weight: 800; color: var(--indigo-deep); }
@@ -587,6 +603,11 @@
     .session-card.rest { display: grid; place-items: center; min-height: 72px; border-style: dashed; background: #fbfcfa; color: #6f8a76; text-align: center; }
     .session-card.today { border-color: var(--indigo); box-shadow: 0 0 0 2px var(--indigo-soft); }
     .rest-chip input:checked + span { background: var(--sage-soft); border-color: #cfe0d3; color: #4b7158; }
+    /* 앱 설치 · 오프라인 */
+    .offline-banner { position: fixed; top: 0; right: 0; left: 0; z-index: 60; padding: 9px 16px; background: #2b3142; color: #fff; font-size: 12.5px; text-align: center; }
+    .install-steps { margin: 8px 0 0; padding-left: 20px; font-size: 12.5px; line-height: 1.8; }
+    .install-steps b { color: var(--indigo-deep); }
+    @media (display-mode: standalone) { .topbar { padding-top: max(8px, env(safe-area-inset-top)); } }
     /* 하루 영양 목표 (자동 계산) */
     .nt-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; margin-top: 8px; }
     .nt-grid .stat-card { padding: 11px 10px; }
@@ -684,6 +705,10 @@
             <button class="quiet-button" id="today-date-button" type="button" data-screen="food">오늘</button>
           </div>
 
+          <section class="surface setup-banner" id="install-banner" hidden>
+            <span><span class="section-title" style="display:block">Healthlingo를 앱으로 설치할 수 있어요</span><span class="section-subtitle" id="install-banner-text">홈 화면에 추가하면 앱처럼 바로 열 수 있어요.</span></span>
+            <span style="display:flex;gap:6px;flex-wrap:wrap"><button class="primary-button small-button" type="button" data-action="install-app">설치하기</button><button class="quiet-button small-button" type="button" data-action="dismiss-install">나중에</button></span>
+          </section>
           <section class="surface setup-banner" id="setup-banner" hidden>
             <span><span class="section-title" style="display:block">개인 설정이 아직 비어 있어요</span><span class="section-subtitle">목표·알레르기·영양 목표를 알려주시면 기록에 맞춘 피드백을 드릴 수 있어요.</span></span>
             <button class="primary-button small-button" type="button" data-action="open-settings">설정하기</button>
@@ -719,6 +744,8 @@
                 </div>
                 <div class="progress-track" id="goal-progress" role="progressbar" aria-label="오늘의 운동 진행률" aria-valuemin="0" aria-valuemax="0" aria-valuenow="0" hidden><div class="progress-fill"></div></div>
                 <div class="today-workout" id="today-workout" aria-live="polite"></div>
+                <div id="today-review" aria-live="polite"></div>
+                <div id="today-feedback"></div>
               </section>
             </div>
 
@@ -906,6 +933,10 @@
             <div class="challenge-list" id="challenge-list"></div>
             <div hidden>
             </div>
+          </section>
+          <section class="surface panel" style="margin-top:17px" aria-labelledby="install-title">
+            <div class="section-head"><div><h2 class="section-title" id="install-title">휴대폰 앱으로 설치</h2><p class="section-subtitle">홈 화면 아이콘으로 바로 열고, 전체 화면으로 써요</p></div></div>
+            <div id="install-panel"></div>
           </section>
           <section class="surface panel" style="margin-top:17px" aria-labelledby="nutrition-title">
             <div class="section-head"><div><h2 class="section-title" id="nutrition-title">하루 영양 목표</h2><p class="section-subtitle">개인 설정으로 자동 계산한 값이에요. 홈·식사 코치의 달성률이 이 값을 써요.</p></div><button class="text-button" type="button" data-action="edit-nutrition">개인 설정 수정</button></div>
@@ -1097,6 +1128,7 @@
   </dialog>
 
   <div class="toast" id="toast" role="status" aria-live="polite"></div>
+  <div class="offline-banner" id="offline-banner" role="status" hidden>인터넷 연결이 끊겼어요. 연결되면 다시 불러올게요.</div>
   <script src="/app.js" defer></script>
 </body>
 </html>

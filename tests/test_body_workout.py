@@ -95,8 +95,19 @@ class WorkoutApiTests(ServerTestCase):
         self.assertEqual(plan["model"], "fake-model")
         # Saved: survives a reload, and goes stale once the body values change.
         self.assertEqual(a.get("/api/workout-plan")[1]["plan"]["sessions"], plan["sessions"])
-        a.put("/api/settings", {"body": {"weight_kg": 64}})
-        self.assertTrue(a.get("/api/workout-plan")[1]["plan"]["stale"])
+        # Changing body values starts the automatic AI review (no button); afterwards the plan reflects the new values.
+        body = a.put("/api/settings", {"body": {"weight_kg": 64}})[1]
+        self.assertTrue(body["routine_review_started"])
+        self.assertEqual(self.fake.agent_calls[-1]["context"]["user"]["body"]["weight_kg"], 64.0)
+        after = a.get("/api/workout-plan")[1]
+        self.assertEqual(after["review"]["status"], "done")
+        self.assertFalse(after["plan"]["stale"])
+        self.fake.mode = "fail"  # if the review fails, the plan stays and is marked stale
+        a.put("/api/settings", {"body": {"weight_kg": 63}})
+        after = a.get("/api/workout-plan")[1]
+        self.assertEqual((after["review"]["status"], after["plan"]["stale"]), ("failed", True))
+        self.assertEqual(after["plan"]["sessions"], plan["sessions"])
+        self.fake.mode = "ok"
         # Another account never sees it.
         b = self.login("사용자B")
         self.assertIsNone(b.get("/api/workout-plan")[1]["plan"])
@@ -140,7 +151,15 @@ def next_weekday(start: date, weekday: int) -> str:
     return (start + timedelta(days=(weekday - start.weekday()) % 7)).isoformat()
 
 
-class WeeklyRoutineApiTests(ServerTestCase):
+class PinnedWeek(ServerTestCase):
+    """Routines are saved per week: pin the server's date to the week the test dates are in (Mon 2026-11-02)."""
+
+    def setUp(self):
+        super().setUp()
+        self.server.app.today_override = date(2026, 11, 2)
+
+
+class WeeklyRoutineApiTests(PinnedWeek):
     def setUp(self):
         super().setUp()
         self.a = self.login()
@@ -162,7 +181,8 @@ class WeeklyRoutineApiTests(ServerTestCase):
         self.assertEqual(monday["status"], "workout")
         self.assertEqual(monday["session"]["title"], "월요일 전신")
         self.assertEqual(self.today_workout(6)["status"], "rest")
-        # Wednesday becomes a workout day: no session for it yet, and the routine is marked stale.
+        # Wednesday becomes a workout day: the automatic review must add it; the default fake reply
+        # (keep, no change) fails the server check, so the plan stays as it was and is marked stale.
         self.a.put("/api/settings", {"rest_days": [6]})
         wednesday = self.today_workout(2)
         self.assertEqual((wednesday["status"], wednesday["stale"]), ("unscheduled", True))
@@ -171,7 +191,7 @@ class WeeklyRoutineApiTests(ServerTestCase):
         self.assertEqual(self.today_workout(0)["status"], "rest")
 
 
-class ExerciseCheckTests(ServerTestCase):
+class ExerciseCheckTests(PinnedWeek):
     def test_checking_exercises_counts_as_a_movement_day(self):
         a = self.login()
         a.put("/api/settings", {"rest_days": [2, 6], "body": {"height_cm": 170, "weight_kg": 65}})

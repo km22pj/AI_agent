@@ -54,9 +54,9 @@ say "3/7 앱 파일 복사 ($APP_DIR)"
 id -u "$APP_USER" >/dev/null 2>&1 \
   || useradd --system --home-dir "$APP_DIR" --shell /usr/sbin/nologin "$APP_USER"
 mkdir -p "$APP_DIR/data"
-rm -rf "$APP_DIR/backend" "$APP_DIR/deploy"
-cp -r "$SRC/backend" "$SRC/deploy" "$APP_DIR/"
-for f in run.py app.js healthlingo_v1.html requirements.txt README.md .env.example; do
+rm -rf "$APP_DIR/backend" "$APP_DIR/deploy" "$APP_DIR/icons"
+cp -r "$SRC/backend" "$SRC/deploy" "$SRC/icons" "$APP_DIR/"
+for f in run.py app.js healthlingo_v1.html manifest.webmanifest sw.js requirements.txt README.md NUTRITION.md .env.example; do
   if [ -f "$SRC/$f" ]; then cp "$SRC/$f" "$APP_DIR/$f"; fi
 done
 find "$APP_DIR/backend" -name '__pycache__' -prune -exec rm -rf {} +

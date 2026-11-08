@@ -213,7 +213,7 @@ You receive the user's current body values (height, weight, skeletal muscle mass
 - amount: sets x reps, or minutes, e.g. "2세트 × 10회", "5분". tip: one short form or safety tip.
 - weight_kg: a concrete starting weight in kg for every exercise that uses an external load (dumbbell, kettlebell, barbell, machine). Base it on body weight, skeletal muscle mass, experience and goal; start conservatively, choosing a weight the user can finish with 2-3 reps left. Use 0 for bodyweight moves, stretching, walking/cardio and bands. Only use loads with equipment the user has.
 - weight_note: what the weight means or how to adjust it, e.g. "한 손 기준", "양손 합계", "맨몸", "밴드 약한 강도", "마지막 2회가 힘들면 적당해요".
-- If progress_review and previous_plan are given, adapt the previous routine to how much of it was completed last week: adjustment "decrease" (less than half done) -> make it easier (one intensity level lower, fewer sets/reps, lighter loads); "increase" (everything done) -> make it a little harder (loads at most 2-10 % heavier, or 1-2 more reps, intensity at most one level higher); "keep" -> keep a similar difficulty. Mention the change in summary.
+- If progress_review (last week's completion) and previous_plan are given, judge yourself whether to keep, increase or decrease from the completion data: do not apply a fixed rule, and do not guess reasons for missed workouts. Change intensity by at most one level and loads by at most 10 %. Mention the decision in summary.
 - cautions: 2-4 short safety notes (e.g. stop if there is pain, consult a professional for medical conditions).
 - questions: always an empty list (the app does not show follow-up questions for routines).
 - Never suggest punishment or compensation exercise (e.g. to burn off food), exercising through pain, extreme volume, or skipping meals."""
@@ -637,7 +637,7 @@ class GeminiJSONClient:
     """
 
     # Recognizing foods in a photo needs little reasoning; estimates and coaching a bit more.
-    THINKING = {"recognize": "minimal", "estimate": "low", "coach": "low", "workout": "low", "explain": "minimal"}
+    THINKING = {"recognize": "minimal", "estimate": "low", "coach": "low", "workout": "low", "explain": "minimal", "agent": "low"}
     FALLBACK_CODES = {"ai_unavailable", "ai_timeout", "ai_rate_limited", "ai_model", "ai_truncated"}
     COOLDOWN_SECONDS = 300
 
@@ -816,6 +816,10 @@ class AIService:
         content = [{"type": "text", "text": "이 날의 식사 기록을 바탕으로 피드백과 추천을 주세요.\n" + json.dumps(payload, ensure_ascii=False)}]
         data, model = self._ask(COACH_SYSTEM, content, COACH_SCHEMA, "coach")
         return {**validate_coach(data, blocked_terms), "model": model}
+
+    def ask_json(self, system: str, content: list[dict], schema: dict, task: str) -> tuple[dict, str | None]:
+        """One structured-output call (used by the routine adjustment loop, which validates on its own)."""
+        return self._ask(system, content, schema, task)
 
     def explain_targets(self, payload: dict) -> dict:
         content = [{"type": "text", "text": "다음 계산 결과를 사용자에게 설명해 주세요.\n" + json.dumps(payload, ensure_ascii=False)}]

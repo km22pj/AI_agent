@@ -199,30 +199,15 @@ class ProgressionTests(unittest.TestCase):
         return {((self.MON + timedelta(days=d)).isoformat(), progression.exercise_key(i, n))
                 for d in days_done for i, n in enumerate(["제자리 걷기", "덤벨 스쿼트", "플랭크"])}
 
-    def test_review_levels(self):
+    def test_review_reports_facts_only(self):
         plan = plan_with()
-        self.assertEqual(progression.review_week(plan, self.MON, self.checks([0, 3]), self.MON)["level"], "increase")
-        self.assertEqual(progression.review_week(plan, self.MON, self.checks([0]), self.MON)["level"], "keep")
-        self.assertEqual(progression.review_week(plan, self.MON, set(), self.MON)["level"], "decrease")
-        # Plan made on Wednesday: only Thursday counts.
-        r = progression.review_week(plan, self.MON + timedelta(days=2), self.checks([3]), self.MON)
-        self.assertEqual((r["planned"], r["done"], r["level"]), (3, 3, "increase"))
+        r = progression.review_week(plan, self.MON, self.checks([0]), self.MON)
+        self.assertEqual((r["planned"], r["done"], r["rate"]), (6, 3, 0.5))
+        self.assertNotIn("level", r)  # keep / increase / decrease is the AI's call now
+        r = progression.review_week(plan, self.MON + timedelta(days=2), self.checks([3]), self.MON)  # made on Wednesday
+        self.assertEqual((r["planned"], r["done"]), (3, 3))
         self.assertIsNone(progression.review_week(plan, self.MON + timedelta(days=7), set(), self.MON))
-
-    def test_decrease_and_increase(self):
-        down, changes = progression.adjust_plan(plan_with(), "decrease")
-        ex = down["sessions"][0]["exercises"]
-        self.assertEqual(down["sessions"][0]["intensity"], "가볍게")
-        self.assertEqual((ex[1]["amount"], ex[1]["weight_kg"], ex[2]["amount"], ex[0]["amount"]), ("2세트 × 8회", 9.0, "2세트 × 24초", "4분"))
-        self.assertTrue(changes)
-        up, _ = progression.adjust_plan(plan_with(), "increase")
-        ex = up["sessions"][0]["exercises"]
-        self.assertEqual(up["sessions"][0]["intensity"], "조금 힘들게")
-        self.assertEqual((ex[1]["weight_kg"], ex[1]["amount"], ex[2]["amount"]), (10.5, "3세트 × 10회", "3세트 × 40초"))  # +5 %
-        light, _ = progression.adjust_plan(plan_with(weight=2.0), "increase")  # 2.1kg rounds back to 2kg
-        self.assertEqual((light["sessions"][0]["exercises"][1]["weight_kg"], light["sessions"][0]["exercises"][1]["amount"]), (2.0, "3세트 × 11회"))
-        same, none = progression.adjust_plan(plan_with(), "keep")
-        self.assertEqual((same, none), (plan_with(), []))
+        self.assertFalse(hasattr(progression, "adjust_plan"))  # the old fixed 50 % / 100 % rule is gone
 
     def test_ai_routine_is_capped_against_previous(self):
         prev = plan_with(weight=10.0)
@@ -236,34 +221,27 @@ class ProgressionTests(unittest.TestCase):
         self.assertEqual(new["sessions"][0]["exercises"][1]["weight_kg"], 11.0)  # at most +10 %
 
 
-class WeeklyAdjustmentApiTests(ServerTestCase):
-    def test_last_week_is_reviewed_once_and_the_routine_changes(self):
+class RegenerateTests(ServerTestCase):
+    def test_regenerate_passes_last_week_facts_and_caps_against_previous(self):
         a = self.login()
         a.put("/api/settings", {"rest_days": [1, 2, 4, 5, 6], "body": {"height_cm": 170, "weight_kg": 65}})  # Mon + Thu
         self.assertEqual(a.post("/api/workout-plan", {"today": TODAY})[0], 200)
         uid = a.get("/api/me")[1]["user"]["id"]
-        last_monday = progression.week_start(date.fromisoformat(TODAY)) - timedelta(days=7)
+        monday = progression.week_start(date.fromisoformat(TODAY))
         app = self.server.app
-        with app.db.write_lock, app.db.connect() as conn:  # pretend the routine was made last week and nothing was done
-            row = conn.execute("SELECT plan FROM workout_plans WHERE user_id = ?", (uid,)).fetchone()
-            plan = __import__("json").loads(row["plan"])
-            plan.pop("adjusted_week")
-            conn.execute("UPDATE workout_plans SET plan = ?, created_at = ? WHERE user_id = ?",
-                         (__import__("json").dumps(plan, ensure_ascii=False), last_monday.isoformat() + "T00:00:00Z", uid))
-        before = a.get(f"/api/workout-plan?today={TODAY}")[1]["plan"]
-        self.assertEqual(before["adjustments"][0]["level"], "decrease")
-        self.assertEqual(before["adjustments"][0]["done"], 0)
-        self.assertEqual({s["intensity"] for s in before["sessions"]}, {"가볍게"})
-        again = a.get(f"/api/workout-plan?today={TODAY}")[1]["plan"]
-        self.assertEqual(len(again["adjustments"]), 1)  # only once per week
-        self.assertEqual(again["sessions"], before["sessions"])
-        # Asking the AI again passes the review along and caps the result against the previous routine.
+        with app.db.write_lock, app.db.connect() as conn:  # the same routine also existed last week, nothing was done
+            row = conn.execute("SELECT * FROM week_plans WHERE user_id = ?", (uid,)).fetchone()
+            last = (monday - timedelta(days=7)).isoformat()
+            conn.execute("INSERT INTO week_plans (user_id, week_start, plan, input_hash, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+                         (uid, last, row["plan"], row["input_hash"], last + "T00:00:00Z", last + "T00:00:00Z"))
         regenerated = a.post("/api/workout-plan", {"today": TODAY})[1]["plan"]
-        self.assertEqual(self.fake.last_workout_input["progress_review"]["adjustment"], "decrease")
+        review = self.fake.last_workout_input["progress_review"]
+        self.assertEqual((review["done"], review["planned"] > 0), (0, True))
+        self.assertNotIn("adjustment", review)  # facts only, no fixed rule
         self.assertIn("previous_plan", self.fake.last_workout_input)
-        self.assertFalse(regenerated["stale"])  # the review is not part of the "settings changed" check
-        self.assertEqual(regenerated["adjustments"][0]["source"], "ai")
-        self.assertLessEqual({s["intensity"] for s in regenerated["sessions"]}, {"가볍게"})  # capped below the previous level
+        self.assertFalse(regenerated["stale"])
+        self.assertEqual(regenerated["adjustments"][0]["source"], "regenerate")
+        self.assertLessEqual({s["intensity"] for s in regenerated["sessions"]}, {"가볍게", "보통"})  # within one level
 
 
 if __name__ == "__main__":
